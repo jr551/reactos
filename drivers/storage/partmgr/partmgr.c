@@ -734,8 +734,9 @@ FdoIoctlDiskSetDriveLayout(
 
     PartMgrReleaseLayoutLock(FdoExtension);
 
-    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
-
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
+    IoSynchronousInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     // notify everyone that the disk layout has changed
     TARGET_DEVICE_CUSTOM_NOTIFICATION notification;
 
@@ -826,13 +827,13 @@ FdoIoctlDiskSetDriveLayoutEx(
         status = IoWritePartitionTableEx(FdoExtension->LowerDevice, layoutEx);
         if (NT_SUCCESS(status))
         {
-            // set updated partition numbers
-            for (UINT32 i = 0; i < layoutEx->PartitionCount; i++)
-            {
-                PPARTITION_INFORMATION_EX part = &layoutEx->PartitionEntry[i];
-
-                part->PartitionNumber = layoutEx->PartitionEntry[i].PartitionNumber;
-            }
+            /* PartMgrUpdatePartitionDevices() assigned the partition numbers in
+             * our private copy, not in the caller's buffer. This is a
+             * METHOD_BUFFERED IOCTL and Irp->IoStatus.Information is set below,
+             * so what the caller gets back is the system buffer: copy the
+             * updated layout into it, otherwise the caller reads back the
+             * numbers it passed in, which are 0 for newly created partitions. */
+            RtlCopyMemory(layoutUser, layoutEx, layoutSize);
         }
     }
 
@@ -855,8 +856,9 @@ FdoIoctlDiskSetDriveLayoutEx(
 
     PartMgrReleaseLayoutLock(FdoExtension);
 
-    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
-
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
+    IoSynchronousInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     // notify everyone that the disk layout has changed
     TARGET_DEVICE_CUSTOM_NOTIFICATION notification;
 
@@ -888,7 +890,9 @@ FdoIoctlDiskUpdateProperties(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
-    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
+    IoSynchronousInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     return STATUS_SUCCESS;
 }
 
@@ -914,7 +918,9 @@ FdoIoctlDiskCreateDisk(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
-    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
+    IoSynchronousInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     return status;
 }
 
@@ -936,7 +942,9 @@ FdoIoctlDiskDeleteDriveLayout(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
-    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
+    IoSynchronousInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     return status;
 }
 
@@ -1068,11 +1076,14 @@ FdoHandleDeviceRelations(
         // now fill the DeviceRelations structure
         TRACE("Reporting %u partitions\n", FdoExtension->EnumeratedPartitionsTotal);
 
+        /* DEVICE_RELATIONS already embeds one object pointer, but the count is
+         * unsigned: subtracting one from a disk with no enumerated partitions
+         * wraps to 0xFFFFFFFF and asks for ~32 GB. Size from the flexible
+         * member instead, which is correct for a count of zero. */
         PDEVICE_RELATIONS deviceRelations =
             ExAllocatePoolWithTag(PagedPool,
-                                  sizeof(DEVICE_RELATIONS)
-                                  + sizeof(PDEVICE_OBJECT)
-                                  * (FdoExtension->EnumeratedPartitionsTotal - 1),
+                                  FIELD_OFFSET(DEVICE_RELATIONS,
+                                               Objects[FdoExtension->EnumeratedPartitionsTotal]),
                                   TAG_PARTMGR);
 
         if (!deviceRelations)

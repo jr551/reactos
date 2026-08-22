@@ -96,6 +96,32 @@ PartitionCreateDevice(
     // The device is initialized
     partitionDevice->Flags &= ~DO_DEVICE_INITIALIZING;
 
+    /* Create the partition symlink immediately so that it is available
+     * when the IOCTL returns, blocking until PnP starts new partition PDOs
+     * so the volume is openable at that point. The symlink is just a name
+     * mapping and does not depend on the device being "started". */
+    {
+        PFDO_EXTENSION fdoExt = FDObject->DeviceExtension;
+        WCHAR symBuf[64];
+        UNICODE_STRING symLink;
+        NTSTATUS symStatus;
+        _swprintf(symBuf, PartitionSymLinkFormat,
+                  fdoExt->DiskData.DeviceNumber, PdoNumber);
+        if (RtlCreateUnicodeString(&symLink, symBuf))
+        {
+            symStatus = IoCreateSymbolicLink(&symLink, &deviceName);
+            if (NT_SUCCESS(symStatus))
+            {
+                partExt->SymlinkCreated = TRUE;
+            }
+            else
+            {
+                ERR("IoCreateSymbolicLink(%wZ) failed with status 0x%08lx\n",
+                    &symLink, symStatus);
+            }
+            RtlFreeUnicodeString(&symLink);
+        }
+    }
     *PDO = partitionDevice;
     return status;
 }
@@ -118,21 +144,27 @@ PartitionHandleStartDevice(
     _swprintf(nameBuf, PartitionSymLinkFormat,
         fdoExtension->DiskData.DeviceNumber, PartExt->DetectedNumber);
 
-    if (!RtlCreateUnicodeString(&partitionSymlink, nameBuf))
+    NTSTATUS status;
+
+    /* Skip symlink creation if already done at device creation time */
+    if (!PartExt->SymlinkCreated)
     {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        if (!RtlCreateUnicodeString(&partitionSymlink, nameBuf))
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        status = IoCreateSymbolicLink(&partitionSymlink, &PartExt->DeviceName);
+
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        PartExt->SymlinkCreated = TRUE;
+
+        INFO("Symlink created %wZ -> %wZ\n", &partitionSymlink, &PartExt->DeviceName);
     }
-
-    NTSTATUS status = IoCreateSymbolicLink(&partitionSymlink, &PartExt->DeviceName);
-
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
-
-    PartExt->SymlinkCreated = TRUE;
-
-    INFO("Symlink created %wZ -> %wZ\n", &partitionSymlink, &PartExt->DeviceName);
 
     // Our partition device will have two interfaces:
     // GUID_DEVINTERFACE_PARTITION and GUID_DEVINTERFACE_VOLUME

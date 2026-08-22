@@ -14,6 +14,7 @@
 #include <ntdddisk.h>
 #include <ndk/psfuncs.h>
 #include <ndk/section_attribs.h>
+#include <ndk/iofuncs.h>
 #include <ioevent.h>
 #include <stdio.h>
 #include <debug/driverdbg.h>
