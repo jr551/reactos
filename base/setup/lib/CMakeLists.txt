@@ -18,6 +18,7 @@ list(APPEND SOURCE
     utils/filesup.c
     utils/fsrec.c
     utils/genlist.c
+    utils/guid.c
     utils/inicache.c
     utils/ntverrsrc.c
     utils/osdetect.c

@@ -817,7 +817,8 @@ IopCreateDefaultDeviceSecurityDescriptor(IN DEVICE_TYPE DeviceType,
               DeviceType != FILE_DEVICE_DFS_FILE_SYSTEM &&
               DeviceType != FILE_DEVICE_NETWORK &&
               DeviceType != FILE_DEVICE_NETWORK_FILE_SYSTEM) ||
-              (HasDeviceName && BooleanFlagOn(DeviceCharacteristics, FILE_FLOPPY_DISKETTE)))
+              (HasDeviceName && (BooleanFlagOn(DeviceCharacteristics, FILE_FLOPPY_DISKETTE) ||
+                                 DeviceType == FILE_DEVICE_DISK)))
     {
         Status = IopCreateSecurityDescriptorPerType(SecurityDescriptor,
                                                     UnrestrictedPublicOpen,

@@ -183,13 +183,18 @@ static void vio_modern_reset(VirtIODevice *vdev)
      * This will flush out the status write, and flush in device writes,
      * including MSI-X interrupts, if any.
      */
-    while (ioread8(vdev, &vdev->common->device_status)) {
-        u16 val;
-        if (pci_read_config_word(vdev, 0, &val) || val == 0xffff) {
-            DPrintf(0, "PCI config space is not readable, probably the device is removed\n", 0);
-            break;
+    {
+        /* Don't wait forever if the device never completes the reset. */
+        int iterations = 1000;
+
+        while (ioread8(vdev, &vdev->common->device_status) && iterations--) {
+            u16 val;
+            if (pci_read_config_word(vdev, 0, &val) || val == 0xffff) {
+                DPrintf(0, "PCI config space is not readable, probably the device is removed\n", 0);
+                break;
+            }
+            vdev_sleep(vdev, 1);
         }
-        vdev_sleep(vdev, 1);
     }
 }
 
@@ -309,7 +314,7 @@ static NTSTATUS vio_modern_setup_vq(struct virtqueue **queue,
 
     /* try to allocate contiguous pages, scale down on failure */
     while (!(info->queue = mem_alloc_contiguous_pages(vdev, vring_pci_size(info->num, vdev->packed_ring)))) {
-        if (info->num > 0) {
+        if (info->num > 1) {
             info->num /= 2;
         } else {
             return STATUS_INSUFFICIENT_RESOURCES;

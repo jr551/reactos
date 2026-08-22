@@ -15,6 +15,7 @@
 // #include <ntdddisk.h>
 #include <ntddstor.h>
 #include <ntddscsi.h>
+#include <diskguid.h> // For the GPT partition type GUIDs (PARTITION_SYSTEM_GUID, ...)
 
 #include "resource.h"
 
@@ -839,6 +840,28 @@ FindVolCreateInTreeByVolume(
     return NULL;
 }
 
+static
+HTLITEM
+FindPartitionItem(
+    _In_ HWND hTreeList,
+    _In_ PPARTENTRY PartEntry)
+{
+    HTLITEM hItem;
+
+    /* Enumerate every cached data in the TreeList, and for each, check
+     * whether its corresponding PPARTENTRY is the one we are looking for */
+    hItem = TVI_ROOT;
+    while ((hItem = TreeList_GetNextItem(hTreeList, hItem, TVGN_NEXTITEM)))
+    {
+        PPARTITEM PartItem = GetItemPartition(hTreeList, hItem);
+        if (PartItem && PartItem->PartEntry == PartEntry)
+            return hItem;
+    }
+
+    /* Nothing was found */
+    return NULL;
+}
+
 
 VOID
 GetPartitionTypeString(
@@ -846,7 +869,31 @@ GetPartitionTypeString(
     OUT PSTR strBuffer,
     IN ULONG cchBuffer)
 {
-    if (PartEntry->PartitionType == PARTITION_ENTRY_UNUSED)
+    if (PartEntry->DiskEntry->DiskStyle == PARTITION_STYLE_GPT)
+    {
+        PCSTR Description;
+
+        if (IsEqualGUID(&PartEntry->PartitionGuid, &PARTITION_ENTRY_UNUSED_GUID))
+        {
+            StringCchCopyA(strBuffer, cchBuffer,
+                           "Unused" /* MUIGetString(STRING_FORMATUNUSED) */);
+        }
+        else
+        {
+            /* Do the table lookup on the GPT partition type GUID */
+            Description = LookupPartitionTypeString(PARTITION_STYLE_GPT,
+                                                    &PartEntry->PartitionGuid);
+            if (Description)
+            {
+                StringCchCopyA(strBuffer, cchBuffer, Description);
+                return;
+            }
+
+            /* We are here because the partition type is unknown */
+            if (cchBuffer > 0) *strBuffer = '\0';
+        }
+    }
+    else if (PartEntry->PartitionType == PARTITION_ENTRY_UNUSED)
     {
         StringCchCopyA(strBuffer, cchBuffer,
                        "Unused" /* MUIGetString(STRING_FORMATUNUSED) */);
@@ -987,8 +1034,7 @@ PrintPartitionData(
     if (!PartItem)
     {
         DPRINT1("Failed to allocate partition-info structure\n");
-        // return NULL;
-        // We'll store a NULL pointer?!
+        return NULL;
     }
 
     PartItem->PartEntry = PartEntry;
@@ -1565,6 +1611,168 @@ DoDeletePartition(
 }
 
 
+/**
+ * @brief
+ * On (U)EFI machines, initializes an uninitialized (RAW) disk as GPT with
+ * an automatically-created EFI System Partition (ESP) at its beginning
+ * (see InitializeDiskGpt()), then creates the installation partition on
+ * the first unpartitioned region of the disk, and refreshes the partition
+ * list UI selecting the new partition.
+ * On BIOS machines, just creates the installation partition on the first
+ * unpartitioned region of the disk.
+ * MBR-partitioned disks are refused on UEFI machines (they cannot be
+ * booted: there is no ESP).
+ *
+ * @param[in]   pSetupData
+ * The setup data, whose PartitionList will be updated.
+ *
+ * @param[in]   hwndDlg
+ * The drive page dialog, used for error reporting and UI refresh.
+ *
+ * @param[in]   DiskEntry
+ * The disk to auto-partition.
+ *
+ * @return  The created installation partition, or NULL on failure.
+ **/
+static PPARTENTRY
+CreateInstallPartitionOnDisk(
+    _In_ PSETUPDATA pSetupData,
+    _In_ HWND hwndDlg,
+    _In_ PDISKENTRY DiskEntry)
+{
+    HWND hList;
+    PPARTENTRY FreeRegion;
+    PPARTENTRY PartEntry;
+    PLIST_ENTRY Entry;
+
+    /* On UEFI machines, initialize an uninitialized disk as GPT (this
+     * automatically creates the ESP). MBR disks cannot be booted on UEFI
+     * machines (they have no ESP), so refuse. */
+    if (pSetupData->USetupData.ArchType == ARCH_Efi)
+    {
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_MBR)
+        {
+            DPRINT1("CreateInstallPartitionOnDisk: refusing an MBR disk (%lu) on a UEFI machine\n",
+                    DiskEntry->DiskNumber);
+            DisplayMessage(hwndDlg, MB_ICONERROR | MB_OK, NULL,
+                           L"Installing ReactOS on an MBR-partitioned disk\n"
+                           L"is not supported on this (U)EFI machine.\n"
+                           L"Please select an unpartitioned disk.");
+            return NULL;
+        }
+
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_RAW)
+        {
+            DPRINT1("CreateInstallPartitionOnDisk: initializing disk %lu as GPT with ESP\n",
+                    DiskEntry->DiskNumber);
+
+            if (!InitializeDiskGpt(pSetupData->PartitionList, DiskEntry))
+            {
+                DPRINT1("CreateInstallPartitionOnDisk: InitializeDiskGpt() failed on disk %lu\n",
+                        DiskEntry->DiskNumber);
+                DisplayMessage(hwndDlg, MB_ICONERROR | MB_OK, NULL,
+                               L"Could not initialize the disk as GPT\n"
+                               L"(error while creating the EFI System Partition).");
+                return NULL;
+            }
+        }
+    }
+
+    /* Find the first unpartitioned region of the disk */
+    FreeRegion = NULL;
+    for (Entry = DiskEntry->PrimaryPartListHead.Flink;
+         Entry != &DiskEntry->PrimaryPartListHead;
+         Entry = Entry->Flink)
+    {
+        PartEntry = CONTAINING_RECORD(Entry, PARTENTRY, ListEntry);
+        if (!PartEntry->IsPartitioned)
+        {
+            FreeRegion = PartEntry;
+            break;
+        }
+    }
+
+    if (!FreeRegion)
+    {
+        DPRINT1("CreateInstallPartitionOnDisk: no free space left on disk %lu\n",
+                DiskEntry->DiskNumber);
+        DisplayMessage(hwndDlg, MB_ICONERROR | MB_OK, NULL,
+                       L"Could not auto-partition the disk:\n"
+                       L"no unpartitioned space is left on it.");
+        return NULL;
+    }
+
+    /* Create the installation partition on the whole free space */
+    DPRINT1("CreateInstallPartitionOnDisk: creating the installation partition on disk %lu\n",
+            DiskEntry->DiskNumber);
+    if (!CreatePartition(pSetupData->PartitionList, FreeRegion, 0ULL, 0))
+    {
+        DPRINT1("CreateInstallPartitionOnDisk: CreatePartition() failed on disk %lu\n",
+                DiskEntry->DiskNumber);
+        DisplayMessage(hwndDlg, MB_ICONERROR | MB_OK, NULL,
+                       L"Could not create the installation partition.");
+        return NULL;
+    }
+    if (FreeRegion->Volume)
+        FreeRegion->Volume->New |= VOLUME_NEW_AUTOCREATE;
+
+    /* Refresh the partition list UI and select the new partition */
+    hList = GetDlgItem(hwndDlg, IDC_PARTITION);
+    DrawPartitionList(hList, pSetupData->PartitionList);
+    if (!FindPartitionItem(hList, FreeRegion))
+        return NULL;
+    TreeList_SelectItem(hList, FindPartitionItem(hList, FreeRegion));
+
+    return FreeRegion;
+}
+
+/**
+ * @brief
+ * Automatically partitions the whole selected disk (the one of the
+ * currently selected disk node or disk region) and selects the resulting
+ * installation partition:
+ *  - On (U)EFI machines: initializes an uninitialized disk as GPT with an
+ *    automatically-created EFI System Partition (ESP) and creates one
+ *    system partition using all the remaining space.
+ *  - On BIOS machines: creates one partition using all the free space
+ *    of the disk.
+ *
+ * @param[in]   pSetupData
+ * The setup data, whose PartitionList will be updated.
+ *
+ * @param[in]   hwndDlg
+ * The drive page dialog, used for error reporting and UI refresh.
+ *
+ * @return  TRUE on success, FALSE otherwise.
+ **/
+static BOOLEAN
+AutoPartitionSelectedDisk(
+    _In_ PSETUPDATA pSetupData,
+    _In_ HWND hwndDlg)
+{
+    HWND hList;
+    HTLITEM hItem;
+    PPARTITEM PartItem;
+    PPARTENTRY PartEntry;
+    PDISKENTRY DiskEntry;
+
+    hList = GetDlgItem(hwndDlg, IDC_PARTITION);
+    PartItem = GetSelectedPartition(hList, &hItem);
+    if (!PartItem)
+        return FALSE;
+    PartEntry = PartItem->PartEntry;
+    ASSERT(PartEntry && PartEntry->DiskEntry);
+    DiskEntry = PartEntry->DiskEntry;
+
+    DPRINT1("AutoPartitionSelectedDisk: disk %lu, disk style %lu, arch %lu\n",
+            DiskEntry->DiskNumber, DiskEntry->DiskStyle,
+            pSetupData->USetupData.ArchType);
+
+    /* Create the GPT layout (with ESP) on UEFI machines, and the
+     * installation partition on the whole remaining space */
+    return (CreateInstallPartitionOnDisk(pSetupData, hwndDlg, DiskEntry) != NULL);
+}
+
 static BOOLEAN
 SelectInstallPartition(
     _In_ PSETUPDATA pSetupData,
@@ -1583,11 +1791,86 @@ SelectInstallPartition(
     ASSERT(PartEntry);
 
     /*
+     * On (U)EFI machines, an uninitialized (RAW) disk must be initialized
+     * as GPT, with an EFI System Partition (ESP) automatically created at
+     * its beginning (see InitializeDiskGpt()). The ESP is the system
+     * partition onto which the UEFI bootloader will be installed, and
+     * MBR-partitioned disks cannot be booted on UEFI machines.
+     */
+    if (pSetupData->USetupData.ArchType == ARCH_Efi)
+    {
+        PDISKENTRY DiskEntry = PartEntry->DiskEntry;
+
+        DPRINT1("SelectInstallPartition: UEFI machine (ArchType %lu); disk %lu, disk style %lu\n",
+                pSetupData->USetupData.ArchType, DiskEntry->DiskNumber,
+                DiskEntry->DiskStyle);
+
+        /* MBR disks cannot be booted on UEFI machines (no ESP) */
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_MBR)
+        {
+            DPRINT1("SelectInstallPartition: refusing an MBR disk (%lu) on a UEFI machine\n",
+                    DiskEntry->DiskNumber);
+            DisplayMessage(hwndDlg, MB_ICONERROR | MB_OK, NULL,
+                           L"Installing ReactOS on an MBR-partitioned disk\n"
+                           L"is not supported on this (U)EFI machine.\n"
+                           L"Please select an unpartitioned disk.");
+            return FALSE; // Fail
+        }
+
+        /* Initialize an uninitialized disk as GPT (this creates the ESP):
+         * present the GPT layout as the required choice and ask for an
+         * explicit confirmation before initializing the disk. */
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_RAW)
+        {
+            INT nRet;
+
+            DPRINT1("SelectInstallPartition: presenting GPT layout choice for disk %lu\n",
+                    DiskEntry->DiskNumber);
+            nRet = DisplayMessage(hwndDlg,
+                                  MB_ICONINFORMATION | MB_OKCANCEL,
+                                  L"Initialize disk as GPT",
+                                  L"This (U)EFI machine requires the disk to be\n"
+                                  L"partitioned using GPT.\n"
+                                  L"\n"
+                                  L"The disk will be initialized as GPT, and an\n"
+                                  L"EFI System Partition (ESP) will be automatically\n"
+                                  L"created at its beginning.\n"
+                                  L"\n"
+                                  L"Click on OK to continue."
+                                  L"\nClick on CANCEL to go back to the partitions list.");
+            if (nRet != IDOK)
+                return FALSE; // Fail
+
+            /* Initialize the disk (if needed) and create the installation
+             * partition on the remaining space */
+            PartEntry = CreateInstallPartitionOnDisk(pSetupData, hwndDlg, DiskEntry);
+            if (!PartEntry)
+                return FALSE; // Fail
+
+            /* Refresh the partition list UI and re-select the new
+             * installation partition in the tree */
+            hItem = FindPartitionItem(hList, PartEntry);
+            if (!hItem)
+                return FALSE; // Fail
+            TreeList_SelectItem(hList, hItem);
+            PartItem = GetItemPartition(hList, hItem);
+            if (!PartItem)
+                return FALSE; // Fail
+        }
+        /* On already-GPT disks, fall through to the normal logic below:
+         * either create a partition on the selected free space, or use
+         * (and format) the selected existing partition. */
+    }
+
+    /*
      * Check whether the user wants to install ReactOS on a disk that
      * is not recognized by the computer's firmware and if so, display
      * a warning since such disks may not be bootable.
+     * (On UEFI machines, disks are not discovered via the legacy BIOS
+     * services, so this check does not apply.)
      */
-    if (PartEntry->DiskEntry->MediaType == FixedMedia &&
+    if (pSetupData->USetupData.ArchType != ARCH_Efi &&
+        PartEntry->DiskEntry->MediaType == FixedMedia &&
         !PartEntry->DiskEntry->BiosFound)
     {
         INT nRet;
@@ -1704,6 +1987,8 @@ DriveDlgProc(
             /* Initially hide and disable all partitioning buttons */
             ShowDlgItem(hwndDlg, IDC_INITDISK, SW_HIDE);
             EnableDlgItem(hwndDlg, IDC_INITDISK, FALSE);
+            ShowDlgItem(hwndDlg, IDC_PARTAUTO, SW_HIDE);
+            EnableDlgItem(hwndDlg, IDC_PARTAUTO, FALSE);
             ShowDlgItem(hwndDlg, IDC_PARTCREATE, SW_HIDE);
             EnableDlgItem(hwndDlg, IDC_PARTCREATE, FALSE);
             ShowDlgItem(hwndDlg, IDC_PARTFORMAT, SW_HIDE);
@@ -1745,6 +2030,16 @@ DriveDlgProc(
             case IDC_INITDISK:
             {
                 // TODO: Implement disk partitioning initialization
+                return TRUE;
+            }
+
+            case IDC_PARTAUTO:
+            {
+                /* Automatically partition the whole selected disk:
+                 * on UEFI machines this creates the GPT layout with an ESP,
+                 * on BIOS machines one partition using the whole disk. */
+                DPRINT1("IDC_PARTAUTO: auto-partitioning the selected disk\n");
+                AutoPartitionSelectedDisk(pSetupData, hwndDlg);
                 return TRUE;
             }
 
@@ -1967,17 +2262,31 @@ DriveDlgProc(
                     {
                         /* Hard disk */
                         PDISKENTRY DiskEntry = (PDISKENTRY)pnmv->itemNew.lParam;
+                        BOOL CanAutoPartition;
                         ASSERT(DiskEntry);
 
-                        /* Show the "Initialize" disk button and hide and disable the others */
-                        ShowDlgItem(hwndDlg, IDC_INITDISK, SW_SHOW);
-
-#if 0 // FIXME: Init disk not implemented yet!
-                        EnableDlgItem(hwndDlg, IDC_INITDISK,
-                                      DiskEntry->DiskStyle == PARTITION_STYLE_RAW);
-#else
+                        /* Hide the unimplemented "Initialize" disk button */
+                        ShowDlgItem(hwndDlg, IDC_INITDISK, SW_HIDE);
                         EnableDlgItem(hwndDlg, IDC_INITDISK, FALSE);
-#endif
+
+                        /*
+                         * Show the "Auto" partition button: it partitions the
+                         * whole selected disk automatically (GPT + ESP on UEFI
+                         * machines, one MBR partition on BIOS ones). It is
+                         * enabled only when the disk can actually be partitioned:
+                         * - uninitialized (RAW) disks: always;
+                         * - GPT disks on UEFI machines: to use the free space;
+                         * - MBR disks on UEFI machines: not bootable (no ESP),
+                         *   so the button is disabled;
+                         * - already-partitioned MBR disks on BIOS machines:
+                         *   nothing to do, so the button is disabled.
+                         */
+                        CanAutoPartition =
+                            (DiskEntry->DiskStyle == PARTITION_STYLE_RAW) ||
+                            (pSetupData->USetupData.ArchType == ARCH_Efi &&
+                             DiskEntry->DiskStyle == PARTITION_STYLE_GPT);
+                        ShowDlgItem(hwndDlg, IDC_PARTAUTO, SW_SHOW);
+                        EnableDlgItem(hwndDlg, IDC_PARTAUTO, CanAutoPartition);
 
                         ShowDlgItem(hwndDlg, IDC_PARTCREATE, SW_HIDE);
                         EnableDlgItem(hwndDlg, IDC_PARTCREATE, FALSE);
@@ -2004,6 +2313,10 @@ DriveDlgProc(
                         /* Hide and disable the "Initialize" disk button */
                         ShowDlgItem(hwndDlg, IDC_INITDISK, SW_HIDE);
                         EnableDlgItem(hwndDlg, IDC_INITDISK, FALSE);
+
+                        /* Hide and disable the "Auto" partition button */
+                        ShowDlgItem(hwndDlg, IDC_PARTAUTO, SW_HIDE);
+                        EnableDlgItem(hwndDlg, IDC_PARTAUTO, FALSE);
 
                         /* Check whether the selected disk region is not partitioned, and
                          * can be partitioned according to the disk's partitioning scheme */

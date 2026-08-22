@@ -10,10 +10,12 @@
 
 #include <ntifs.h>
 #include <mountdev.h>
+#include <mountmgr.h>
 #include <ntddvol.h>
 #include <ntdddisk.h>
 #include <ndk/psfuncs.h>
 #include <ndk/section_attribs.h>
+#include <ndk/iofuncs.h>
 #include <ioevent.h>
 #include <stdio.h>
 #include <debug/driverdbg.h>
@@ -145,6 +147,15 @@ NTSTATUS
 PartitionHandlePnp(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP Irp);
+
+CODE_SEG("PAGE")
+NTSTATUS
+PartitionNotifyMountMgr(
+    _In_ PUNICODE_STRING DeviceName);
+
+VOID
+PartMgrNotifyMountMgrOfPartitions(
+    _In_ PFDO_EXTENSION FdoExtension);
 
 NTSTATUS
 PartitionHandleDeviceControl(

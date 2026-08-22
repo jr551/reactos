@@ -21,6 +21,11 @@
 
 #include <freeldr.h>
 
+#ifdef UEFIBOOT
+/* Implemented in arch/uefi/uefiutil.c; reboots into the UEFI firmware setup */
+VOID UefiRebootToFirmware(VOID);
+#endif
+
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(WARNING);
 
@@ -388,6 +393,7 @@ VOID RunLoader(VOID)
     OperatingSystemItem* OperatingSystemList;
     PCSTR* OperatingSystemDisplayNames;
     ULONG OperatingSystemCount;
+    ULONG MenuEntryCount;
     ULONG SelectedOperatingSystem;
     ULONG i;
 
@@ -433,7 +439,8 @@ VOID RunLoader(VOID)
     ASSERT(OperatingSystemCount != 0);
 
     /* Create list of display names */
-    OperatingSystemDisplayNames = FrLdrTempAlloc(sizeof(PCSTR) * OperatingSystemCount, 'mNSO');
+    MenuEntryCount = OperatingSystemCount;
+    OperatingSystemDisplayNames = FrLdrTempAlloc(sizeof(PCSTR) * (MenuEntryCount + 1), 'mNSO');
     if (!OperatingSystemDisplayNames)
         goto Fallback;
 
@@ -441,6 +448,16 @@ VOID RunLoader(VOID)
     {
         OperatingSystemDisplayNames[i] = OperatingSystemList[i].LoadIdentifier;
     }
+
+#ifdef UEFIBOOT
+    /* When the machine has been booted via (U)EFI, offer an extra entry to
+     * reboot into the UEFI firmware setup UI. */
+    if (UiIsBootViaUefi())
+    {
+        OperatingSystemDisplayNames[MenuEntryCount] = "System Firmware";
+        ++MenuEntryCount;
+    }
+#endif
 
     for (;;)
     {
@@ -454,7 +471,7 @@ VOID RunLoader(VOID)
                            "Press F8 for troubleshooting and advanced startup options."
                            "     F2: FreeLdr SETUP",
                            OperatingSystemDisplayNames,
-                           OperatingSystemCount,
+                           MenuEntryCount,
                            SelectedOperatingSystem,
                            GetBootMgrInfo()->TimeOut,
                            &SelectedOperatingSystem,
@@ -465,6 +482,17 @@ VOID RunLoader(VOID)
             UiMessageBox("Press ENTER to reboot.");
             goto Reboot;
         }
+
+#ifdef UEFIBOOT
+        /* If the user selected the "System Firmware" entry, reboot the
+         * machine into the UEFI firmware setup (this does not return). */
+        if (UiIsBootViaUefi() && (SelectedOperatingSystem >= OperatingSystemCount))
+        {
+            UefiRebootToFirmware();
+            UiMessageBox("Press ENTER to reboot.");
+            goto Reboot;
+        }
+#endif
 
         /* Load the chosen operating system */
         LoadOperatingSystem(&OperatingSystemList[SelectedOperatingSystem]);

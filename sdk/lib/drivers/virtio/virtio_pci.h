@@ -39,6 +39,8 @@
 #ifndef _LINUX_VIRTIO_PCI_H
 #define _LINUX_VIRTIO_PCI_H
 
+#include "osdep.h"
+
 #include "linux/types.h"
 #include "linux/virtio_config.h"
 
@@ -363,7 +365,7 @@ void virtio_delete_queues(VirtIODevice *vdev);
 u32 virtio_get_queue_size(struct virtqueue *vq);
 unsigned long virtio_get_indirect_page_capacity();
 
-static ULONG FORCEINLINE virtio_get_queue_descriptor_size()
+static ULONG virtio_get_queue_descriptor_size()
 {
     return sizeof(VirtIOQueueInfo);
 }

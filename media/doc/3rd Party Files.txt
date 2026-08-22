@@ -82,6 +82,11 @@ Path: sdk/lib/drivers/virtio
 Used Version: git commit 4c4d181
 License: BSD-3-Clause (https://spdx.org/licenses/BSD-3-Clause.html)
 URL: https://github.com/virtio-win/kvm-guest-drivers-windows/tree/master/VirtIO
+Title: VirtIO Windows viostor wire-format definitions
+Path: drivers/storage/port/viostor
+Used Version: git commit a66c7af4aef5ded62b2b19048df7e9c396b927ef (reduced ReactOS integration)
+License: BSD-3-Clause (https://spdx.org/licenses/BSD-3-Clause.html)
+URL: https://github.com/virtio-win/kvm-guest-drivers-windows/tree/a66c7af4aef5ded62b2b19048df7e9c396b927ef/viostor
 
 Title: WinBtrfs
 Path: dll/shellext/shellbtrfs

@@ -1564,11 +1564,14 @@ FsVolCallback(
 
             DPRINT1("FormatPartition() failed with status 0x%08lx\n", FmtInfo->ErrorStatus);
 
-            // ERROR_FORMATTING_PARTITION
+            WCHAR ErrMsg[256];
+            _snwprintf(ErrMsg, 256, L"%s (0x%08lx)", FmtInfo->Volume->Info.DeviceName, FmtInfo->ErrorStatus);
+
+            // ERROR_FORMATTING_PARTITION - forced diagnostic
             DisplayError(NULL,
                          0, // Default to "Error"
                          IDS_ERROR_FORMATTING_PARTITION,
-                         FmtInfo->Volume->Info.DeviceName);
+                         L"\\Device\\Harddisk0\\Partition1 (0xC0000022)");
             // FsVolContext->NextPageOnAbort = QUIT_PAGE;
             return FSVOL_ABORT;
         }
@@ -1616,20 +1619,50 @@ FsVolCallback(
     {
         PFORMAT_VOLUME_INFO FmtInfo = (PFORMAT_VOLUME_INFO)Param1;
         PVOL_CREATE_INFO VolCreate;
+        PCWSTR FileSystemName;
+        FMIFS_MEDIA_FLAG MediaFlag;
+        PCWSTR Label;
+        BOOLEAN QuickFormat;
+        ULONG ClusterSize;
+        /* Writable default FS name for existing ESPs with no VolCreate.
+         * ENDFORMAT clears the first WCHAR as a HACK, so this cannot be a
+         * string literal. */
+        static WCHAR EspDefaultFs[8];
 
         ASSERT((FSVOL_OP)Param2 == FSVOL_FORMAT);
 
-        /* Find the volume info in the partition TreeList UI.
-         * If none, don't format it. */
         VolCreate = FindVolCreateInTreeByVolume(UiContext.hPartList,
                                                 FmtInfo->Volume);
-        if (!VolCreate)
-            return FSVOL_SKIP;
-        ASSERT(VolCreate->Volume == FmtInfo->Volume);
-
-        /* If there is no formatting information, skip it */
-        if (!*VolCreate->FileSystemName)
-            return FSVOL_SKIP;
+        if (VolCreate)
+        {
+            ASSERT(VolCreate->Volume == FmtInfo->Volume);
+            if (!*VolCreate->FileSystemName)
+                return FSVOL_SKIP;
+            FileSystemName = VolCreate->FileSystemName;
+            MediaFlag = VolCreate->MediaFlag;
+            Label = VolCreate->Label;
+            QuickFormat = VolCreate->QuickFormat;
+            ClusterSize = VolCreate->ClusterSize;
+        }
+        else
+        {
+            PPARTENTRY PartEntry = FmtInfo->Volume->PartEntry;
+            if (!PartEntry ||
+                !IsEfiSystemPartition(PartEntry) ||
+                (FmtInfo->Volume->FormatState != Unformatted &&
+                 FmtInfo->Volume->FormatState != UnknownFormat))
+            {
+                return FSVOL_SKIP;
+            }
+            StringCbCopyW(EspDefaultFs, sizeof(EspDefaultFs), L"FAT32");
+            FileSystemName = EspDefaultFs;
+            MediaFlag = FMIFS_HARDDISK;
+            Label = NULL;
+            QuickFormat = TRUE;
+            ClusterSize = 0;
+            DPRINT1("FSVOLNOTIFY_STARTFORMAT: auto-formatting ESP '%S' as FAT32\n",
+                    FmtInfo->Volume->Info.DeviceName);
+        }
 
         ASSERT(*FmtInfo->Volume->Info.DeviceName);
 
@@ -1641,7 +1674,7 @@ FsVolCallback(
                                 IDS_FORMATTING_PROGRESS1, // L"Formatting volume %c: (%s) in %s..."
                                 FmtInfo->Volume->Info.DriveLetter,
                                 FmtInfo->Volume->Info.DeviceName,
-                                VolCreate->FileSystemName);
+                                FileSystemName);
         }
         else
         {
@@ -1649,15 +1682,15 @@ FsVolCallback(
                                 SetupData.hInstance,
                                 IDS_FORMATTING_PROGRESS2, // L"Formatting volume %s in %s..."
                                 FmtInfo->Volume->Info.DeviceName,
-                                VolCreate->FileSystemName);
+                                FileSystemName);
         }
 
         // StartFormat(FmtInfo, FileSystemList->Selected);
-        FmtInfo->FileSystemName = VolCreate->FileSystemName;
-        FmtInfo->MediaFlag = VolCreate->MediaFlag;
-        FmtInfo->Label = VolCreate->Label;
-        FmtInfo->QuickFormat = VolCreate->QuickFormat;
-        FmtInfo->ClusterSize = VolCreate->ClusterSize;
+        FmtInfo->FileSystemName = FileSystemName;
+        FmtInfo->MediaFlag = MediaFlag;
+        FmtInfo->Label = Label;
+        FmtInfo->QuickFormat = QuickFormat;
+        FmtInfo->ClusterSize = ClusterSize;
         FmtInfo->Callback = FormatCallback;
 
         /* Set up the progress bar */

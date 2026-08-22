@@ -93,6 +93,7 @@ buslogic.sys = 1,,,,,,x,4,,,,1,4
 blue.sys     = 1,,,,,,x,4,,,,1,4
 vgafonts.cab = 1,,,,,,,1,,,,1,1
 bootvid.dll  = 1,,,,,,,2,,,,1,2
+lfbbvid.dll  = 1,,,,,,,2,,,,1,2
 c_437.nls    = 1,,,,,,,2,,,,1,2
 c_1252.nls   = 1,,,,,,,2,,,,1,2
 cdfs.sys     = 1,,,,,,x,4,,,,1,4
@@ -121,6 +122,7 @@ l_intl.nls   = 1,,,,,,,2,,,,1,2
 pci.sys      = 1,,,,,,x,4,,,,1,4
 scsiport.sys = 1,,,,,,,4,,,,1,4
 storport.sys = 1,,,,,,,4,,,,1,4
+viostor.sys  = 1,,,,,,,4,,,,1,4
 fastfat.sys  = 1,,,,,,x,4,,,,1,4
 btrfs.sys    = 1,,,,,,x,4,,,,1,4
 ramdisk.sys  = 1,,,,,,x,4,,,,1,4
@@ -165,7 +167,8 @@ PCI\CC_0101 = pciide
 PCI\CC_0104 = pciide
 PCI\CC_0105 = pciide
 PCI\CC_0106 = pciide
-;PCI\CC_0106 = storahci
+PCI\CC_010601 = storahci
+PCI\VEN_1AF4&DEV_1001 = viostor
 ;*PNP0600 = uniata
 *PNP0600 = atapi
 USB\CLASS_09 = usbhub
@@ -213,6 +216,7 @@ atapi = atapi.sys
 atapi = atapi.sys
 buslogic = buslogic.sys
 storahci = storahci.sys
+viostor = viostor.sys
 disk = disk.sys
 
 [MouseDrivers.Load]
@@ -223,7 +227,7 @@ Cabinet = reactos.cab
 
 [SetupData]
 DefaultPath = \ReactOS
-SetupDebugOptions = "/DEBUG /KDSERIAL /DEBUGPORT=COM1 /FIRSTCHANCE"
+SetupDebugOptions = "/DEBUGPORT=COM1 /BAUDRATE=115200"
 ;SetupDebugOptions = "/DEBUG /SOS /DEBUGPORT=SCREEN"
 OsLoadOptions = "/FASTDETECT /NOGUIBOOT /NODEBUG"
 

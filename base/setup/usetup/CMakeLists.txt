@@ -20,6 +20,7 @@ list(APPEND SOURCE
     fmtchk.c
     fslist.c
     genlist.c
+    guid.c
     keytrans.c
     mui.c
     partlist.c

@@ -1,0 +1,18 @@
+[AddReg]
+HKLM,"SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\PCI#VEN_1AF4&DEV_1050","Service",0x00000000,"virtio_gpu"
+HKLM,"SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\PCI#VEN_1AF4&DEV_1050","ClassGUID",0x00000000,"{4D36E968-E325-11CE-BFC1-08002BE10318}"
+HKLM,"SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\PCI#VEN_1AF4&DEV_1010","Service",0x00000000,"virtio_gpu"
+HKLM,"SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\PCI#VEN_1AF4&DEV_1010","ClassGUID",0x00000000,"{4D36E968-E325-11CE-BFC1-08002BE10318}"
+
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu","ErrorControl",0x00010001,0x00000000
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu","Group",0x00000000,"Video"
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu","ImagePath",0x00020000,"system32\drivers\virtio_gpu.sys"
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu","Start",0x00010001,0x00000003
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu","Type",0x00010001,0x00000001
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Video","Service",0x00000000,"virtio_gpu"
+
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Device0","Device Description",0x00000000,"VirtIO GPU"
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Device0","InstalledDisplayDrivers",0x00010000,"framebuf"
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Device0","VgaCompatible",0x00010001,0
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Device0","DefaultSettings.XResolution",0x00010001,1024
+HKLM,"SYSTEM\CurrentControlSet\Services\virtio_gpu\Device0","DefaultSettings.YResolution",0x00010001,768

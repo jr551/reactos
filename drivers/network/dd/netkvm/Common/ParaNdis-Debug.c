@@ -134,6 +134,7 @@ static void __cdecl DebugPrint(const char *fmt, ...)
         }
     }
 #endif
+    va_end(list);
 }
 
 DEBUGPRINTFUNC pDebugPrint = DebugPrint;

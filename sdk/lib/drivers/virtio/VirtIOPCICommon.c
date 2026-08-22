@@ -243,9 +243,16 @@ static NTSTATUS vp_setup_vq(struct virtqueue **queue,
                             VirtIODevice *vdev, unsigned index,
                             u16 msix_vec)
 {
-    VirtIOQueueInfo *info = &vdev->info[index];
+    VirtIOQueueInfo *info;
+    NTSTATUS status;
 
-    NTSTATUS status = vdev->device->setup_queue(queue, vdev, info, index, msix_vec);
+    if (index >= vdev->maxQueues) {
+        return STATUS_NOT_FOUND;
+    }
+
+    info = &vdev->info[index];
+
+    status = vdev->device->setup_queue(queue, vdev, info, index, msix_vec);
     if (NT_SUCCESS(status)) {
         info->vq = *queue;
     }
@@ -373,7 +380,10 @@ int virtio_get_bar_index(PPCI_COMMON_HEADER pPCIHeader, PHYSICAL_ADDRESS BasePA)
         } else if ((BAR.LowPart & PCI_ADDRESS_MEMORY_TYPE_MASK) == PCI_TYPE_64BIT) {
             /* memory space 64-bit */
             BAR.LowPart &= PCI_ADDRESS_MEMORY_ADDRESS_MASK;
-            BAR.HighPart = pPCIHeader->u.type0.BaseAddresses[++i];
+            if (i + 1 < PCI_TYPE0_ADDRESSES)
+                BAR.HighPart = pPCIHeader->u.type0.BaseAddresses[++i];
+            else
+                BAR.HighPart = 0;
         } else {
             /* memory space 32-bit */
             BAR.LowPart &= PCI_ADDRESS_MEMORY_ADDRESS_MASK;

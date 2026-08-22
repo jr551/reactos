@@ -10,6 +10,7 @@ list(APPEND SOURCE
     spapisup/fileqsup.c
     spapisup/infsupp.c
     drivepage.c
+    guid.c
     reactos.c
     treelist.c
     reactos.h)

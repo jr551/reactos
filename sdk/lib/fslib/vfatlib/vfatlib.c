@@ -59,7 +59,7 @@ VfatFormat(
     OBJECT_ATTRIBUTES ObjectAttributes;
     DISK_GEOMETRY DiskGeometry;
     IO_STATUS_BLOCK Iosb;
-    HANDLE FileHandle;
+    HANDLE FileHandle = NULL;
     PARTITION_INFORMATION_EX PartitionInfo;
     FORMAT_CONTEXT Context;
     FAT_TYPE FatType = FAT_UNKNOWN;
@@ -79,19 +79,43 @@ VfatFormat(
 
     InitializeObjectAttributes(&ObjectAttributes,
                                DriveRoot,
-                               0,
+                               OBJ_CASE_INSENSITIVE,
                                NULL,
                                NULL);
 
-    Status = NtOpenFile(&FileHandle,
-                        FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
-                        &ObjectAttributes,
-                        &Iosb,
-                        FILE_SHARE_READ,
-                        FILE_SYNCHRONOUS_IO_ALERT);
+    /*
+     * Retry the write-capable open (up to 30s), but ONLY on transient
+     * statuses (device/name not ready while PnP finishes starting the fresh
+     * partition PDO). Any other failure (ACCESS_DENIED etc.) is permanent:
+     * fail fast and surface the exact status so the real cause is visible.
+     */
+    {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -10000000LL; /* 1s */
+        for (ULONG Retry = 0; Retry < 30; Retry++)
+        {
+            Status = NtOpenFile(&FileHandle,
+                                FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+                                &ObjectAttributes,
+                                &Iosb,
+                                FILE_SHARE_READ,
+                                FILE_SYNCHRONOUS_IO_NONALERT);
+            if (NT_SUCCESS(Status))
+                break;
+            DPRINT("NtOpenFile() retry %lu failed 0x%08x\n", Retry + 1, Status);
+            if (Status != STATUS_NO_SUCH_DEVICE &&
+                Status != STATUS_OBJECT_NAME_NOT_FOUND &&
+                Status != STATUS_DEVICE_NOT_READY)
+            {
+                DPRINT1("NtOpenFile() non-transient failure 0x%08x, aborting retries\n", Status);
+                break;
+            }
+            NtDelayExecution(FALSE, &Delay);
+        }
+    }
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("NtOpenFile() failed with status 0x%08x\n", Status);
+        DPRINT1("VfatFormat: FINAL open failure status 0x%08x for '%wZ'\n", Status, DriveRoot);
         return FALSE;
     }
 

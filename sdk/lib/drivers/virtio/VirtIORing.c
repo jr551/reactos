@@ -38,6 +38,9 @@
 
 #define DESC_INDEX(num, i) ((i) & ((num) - 1))
 
+#define BUG_ON(condition) { if (condition) { KeBugCheck(0xE0E1E2E3); }}
+#define BAD_RING(vq, fmt, ...) DPrintf(0, "%s: queue %d: " fmt, __FUNCTION__, vq->vq.index, __VA_ARGS__); BUG_ON(true)
+
  /* This marks a buffer as continuing via the next field. */
 #define VIRTQ_DESC_F_NEXT	1
 /* This marks a buffer as write-only (otherwise read-only). */
@@ -207,11 +210,25 @@ static inline u16 get_unused_desc(struct virtqueue_split *vq)
 static inline void put_unused_desc_chain(struct virtqueue_split *vq, u16 idx)
 {
     u16 start = idx;
+    unsigned int count = 0;
+
+    if (idx >= vq->vring.num) {
+        BAD_RING(vq, "id %u out of range\n", idx);
+        return;
+    }
 
     vq->opaque[idx] = NULL;
-    while (vq->vring.desc[idx].flags & VIRTQ_DESC_F_NEXT) {
+    /* Cap the walk at the number of descriptors to guard against
+     * a corrupted chain forming a cycle. */
+    while ((vq->vring.desc[idx].flags & VIRTQ_DESC_F_NEXT) &&
+           count < vq->vring.num) {
         idx = vq->vring.desc[idx].next;
+        if (idx >= vq->vring.num) {
+            BAD_RING(vq, "next descriptor %u out of range\n", idx);
+            return;
+        }
         vq->num_unused++;
+        count++;
     }
 
     vq->vring.desc[idx].flags = VIRTQ_DESC_F_NEXT;
@@ -236,7 +253,9 @@ static int virtqueue_add_buf_split(
     unsigned int i;
     u16 idx;
 
-    if (va_indirect && (out + in) > 1 && vq->num_unused > 0) {
+    if (va_indirect && (out + in) > 1 &&
+        (out + in) <= virtio_get_indirect_page_capacity() &&
+        vq->num_unused > 0) {
         /* Use one indirect descriptor */
         struct vring_desc *desc = (struct vring_desc *)va_indirect;
 
@@ -319,7 +338,15 @@ static void *virtqueue_get_buf_split(
 
     /* Get the first used descriptor */
     idx = (u16)vq->vring.used->ring[idx].id;
+    if (idx >= vq->vring.num) {
+        BAD_RING(vq, "id %u out of range\n", idx);
+        return NULL;
+    }
     opaque = vq->opaque[idx];
+    if (opaque == NULL) {
+        BAD_RING(vq, "id %u is not a head!\n", idx);
+        return NULL;
+    }
 
     /* Put all descriptors back to the free list */
     put_unused_desc_chain(vq, idx);
@@ -495,12 +522,13 @@ struct virtqueue *vring_new_virtqueue_split(
     struct virtqueue_split *vq = splitvq(control);
     u16 i;
 
-    if (DESC_INDEX(num, num) != 0) {
+    if (num == 0 || (num & (num - 1))) {
         DPrintf(0, "Virtqueue length %u is not a power of 2\n", num);
         return NULL;
     }
 
     RtlZeroMemory(vq, sizeof(*vq) + num * sizeof(void *));
+    RtlZeroMemory(pages, vring_size_split(num, vring_align));
 
     vring_init(&vq->vring, num, pages, vring_align);
     vq->vq.vdev = vdev;

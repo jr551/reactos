@@ -1159,6 +1159,13 @@ TransferPktComplete(IN PDEVICE_OBJECT NullFdo, IN PIRP Irp, IN PVOID Context)
          *  We use a field in the original IRP to count
          *  down the transfer pieces as they complete.
          */
+        DbgPrint("XFERDBG: complete pkt=%p origIrp=%p pktIrp=%p cdb0=%02x "
+                 "counter-before=%d retries=%d lowmem=%d\n",
+                 pkt, pkt->OriginalIrp, pkt->Irp,
+                 pkt->Srb ? ((PCDB)SrbGetCdb(pkt->Srb))->CDB6GENERIC.OperationCode : 0xff,
+                 (LONG)(ULONG_PTR)pkt->OriginalIrp->Tail.Overlay.DriverContext[0],
+                 pkt->NumRetries, pkt->InLowMemRetry);
+
         numPacketsRemaining = InterlockedDecrement(
             (PLONG)&pkt->OriginalIrp->Tail.Overlay.DriverContext[0]);
 

@@ -317,6 +317,7 @@ static __inline USHORT CalculateIpv6PseudoHeaderChecksum(IPv6Header *pIpHeader, 
 {
     tIPv6PseudoHeader ipph;
     USHORT checksum;
+    RtlZeroMemory(&ipph, sizeof(ipph));
     ipph.ipph_src[0]  = pIpHeader->ip6_src_address[0];
     ipph.ipph_src[1]  = pIpHeader->ip6_src_address[1];
     ipph.ipph_src[2]  = pIpHeader->ip6_src_address[2];

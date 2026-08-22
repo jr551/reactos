@@ -725,6 +725,7 @@ InitSystemPartition(
 
     if (!SystemPartition)
     {
+        DPRINT1("InitSystemPartition: no supported system partition found!\n");
         FsVolCallback(Context,
                       FSVOLNOTIFY_PARTITIONERROR,
                       ERROR_SYSTEM_PARTITION_NOT_FOUND,
@@ -733,6 +734,11 @@ InitSystemPartition(
     }
 
     *pSystemPartition = SystemPartition;
+    DPRINT1("InitSystemPartition: system partition %lu on disk %lu (install partition %lu on disk %lu)\n",
+            SystemPartition->PartitionNumber,
+            SystemPartition->DiskEntry->DiskNumber,
+            InstallPartition->PartitionNumber,
+            InstallPartition->DiskEntry->DiskNumber);
 
     /*
      * If the system partition can be created in some
@@ -905,7 +911,21 @@ InitDestinationPaths(
 
     if (DiskEntry->MediaType == FixedMedia)
     {
-        if (DiskEntry->BiosFound)
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_GPT)
+        {
+            /*
+             * GPT-partitioned disks are booted via (U)EFI, where the disks
+             * are addressed by their enumeration order: FreeLoader UEFI
+             * uses "multi(0)disk(0)rdisk(<index>)partition(<number>)"
+             * (see boot/freeldr/freeldr/arch/uefi/uefidisk.c).
+             */
+            Status = RtlStringCchPrintfW(PathBuffer, ARRAYSIZE(PathBuffer),
+                             L"multi(0)disk(0)rdisk(%lu)partition(%lu)\\",
+                             DiskEntry->DiskNumber,
+                             PartEntry->OnDiskPartitionNumber);
+            DPRINT1("GPT disk, using MULTI ARC path '%S'\n", PathBuffer);
+        }
+        else if (DiskEntry->BiosFound)
         {
 #if 1
             Status = RtlStringCchPrintfW(PathBuffer, ARRAYSIZE(PathBuffer),
@@ -943,7 +963,7 @@ InitDestinationPaths(
 #else
         Status = RtlStringCchPrintfW(PathBuffer, ARRAYSIZE(PathBuffer),
                          L"signature(%08x)disk(%u)rdisk(%u)partition(%lu)\\",
-                         DiskEntry->LayoutBuffer->Signature,
+                         DiskEntry->LayoutBuffer->Mbr.Signature,
                          DiskEntry->Bus,
                          DiskEntry->Id,
                          PartEntry->OnDiskPartitionNumber);
@@ -1014,6 +1034,188 @@ InitDestinationPaths(
     }
 
     return STATUS_SUCCESS;
+}
+
+/**
+ * @brief
+ * Detects at runtime whether the machine was booted via (U)EFI.
+ *
+ * FreeLoader records the machine's firmware configuration in the registry
+ * tree HKLM\HARDWARE\DESCRIPTION\System\MultifunctionAdapter\<adapter>\,
+ * where each adapter key carries an "Identifier" value describing the bus
+ * or firmware interface it represents:
+ *  - The BIOS FreeLoader creates adapters such as "ISA" and "PNP BIOS"
+ *    (see boot/freeldr/freeldr/arch/i386/pc/machpc.c), and performs INT13
+ *    disk detection, storing the disk configuration data under
+ *    ...\DiskController\*\DiskPeripheral\*.
+ *  - The UEFI FreeLoader always creates a "UEFI Internal" adapter
+ *    (see boot/freeldr/freeldr/arch/uefi/uefihw.c) and performs no INT13
+ *    disk detection at all (there are no INT13 services in UEFI firmware).
+ *
+ * This function therefore first looks for the positive "UEFI Internal"
+ * adapter identifier published by the UEFI FreeLoader: if present, the
+ * machine was booted via (U)EFI. If the adapter tree exists but contains
+ * no "UEFI Internal" adapter, the machine is considered a BIOS machine.
+ * Only in the degenerate case where the MultifunctionAdapter tree is
+ * entirely absent does it fall back to the legacy absence-of-BIOS-disk
+ * heuristic.
+ *
+ * @return  TRUE if the machine was booted via (U)EFI, FALSE otherwise.
+ **/
+static
+BOOLEAN
+IsBootViaEfi(VOID)
+{
+    NTSTATUS Status;
+    ULONG Index;
+    HANDLE KeyHandle;
+    HANDLE AdapterHandle;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    UNICODE_STRING KeyName;
+    UNICODE_STRING AdapterName;
+    UNICODE_STRING IdentifierValueName = RTL_CONSTANT_STRING(L"Identifier");
+    BOOLEAN EfiAdapterFound = FALSE;
+    BOOLEAN AnyAdapterFound = FALSE;
+    ULONG ReturnLength;
+    struct
+    {
+        KEY_BASIC_INFORMATION Info;
+        WCHAR Name[32]; // Adapter key names are decimal numbers, e.g. "0", "1", ...
+    } KeyInfo;
+    struct
+    {
+        KEY_VALUE_PARTIAL_INFORMATION Info;
+        UCHAR Data[128]; // Adapter identifiers are short strings, e.g. "UEFI Internal".
+    } ValueInfo;
+
+    RtlInitUnicodeString(&KeyName,
+                         L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\MultifunctionAdapter");
+
+    InitializeObjectAttributes(&ObjectAttributes,
+                               &KeyName,
+                               OBJ_CASE_INSENSITIVE,
+                               NULL,
+                               NULL);
+
+    Status = NtOpenKey(&KeyHandle,
+                       KEY_ENUMERATE_SUB_KEYS,
+                       &ObjectAttributes);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("IsBootViaEfi: cannot open the 'MultifunctionAdapter' registry key (Status 0x%08lx);\n"
+                "using the legacy absence-of-BIOS-disk fallback.\n", Status);
+        goto Fallback;
+    }
+
+    /* Enumerate the adapter subkeys and look for the "UEFI Internal" one */
+    for (Index = 0; ; ++Index)
+    {
+        Status = NtEnumerateKey(KeyHandle,
+                                Index,
+                                KeyBasicInformation,
+                                &KeyInfo.Info,
+                                sizeof(KeyInfo),
+                                &ReturnLength);
+        if (Status == STATUS_NO_MORE_ENTRIES)
+            break;
+        if (!NT_SUCCESS(Status))
+            continue;
+
+        AnyAdapterFound = TRUE;
+
+        /* Open the adapter key (relative to the MultifunctionAdapter key) */
+        AdapterName.Length = AdapterName.MaximumLength =
+            (USHORT)KeyInfo.Info.NameLength;
+        AdapterName.Buffer = KeyInfo.Info.Name;
+        InitializeObjectAttributes(&ObjectAttributes,
+                                   &AdapterName,
+                                   OBJ_CASE_INSENSITIVE,
+                                   KeyHandle,
+                                   NULL);
+        Status = NtOpenKey(&AdapterHandle,
+                           KEY_QUERY_VALUE,
+                           &ObjectAttributes);
+        if (!NT_SUCCESS(Status))
+            continue;
+
+        /* Query the 'Identifier' value */
+        Status = NtQueryValueKey(AdapterHandle,
+                                 &IdentifierValueName,
+                                 KeyValuePartialInformation,
+                                 &ValueInfo.Info,
+                                 sizeof(ValueInfo),
+                                 &ReturnLength);
+        NtClose(AdapterHandle);
+        if (!NT_SUCCESS(Status) || ValueInfo.Info.Type != REG_SZ)
+            continue;
+
+        DPRINT1("IsBootViaEfi: adapter '%wZ' identifier '%S'\n",
+                &AdapterName, ValueInfo.Info.Data);
+
+        if (_wcsicmp((PCWSTR)ValueInfo.Info.Data, L"UEFI Internal") == 0)
+        {
+            EfiAdapterFound = TRUE;
+            break;
+        }
+    }
+
+    NtClose(KeyHandle);
+
+    if (EfiAdapterFound)
+    {
+        DPRINT1("IsBootViaEfi: 'UEFI Internal' adapter found: UEFI machine\n");
+        return TRUE;
+    }
+
+    if (AnyAdapterFound)
+    {
+        DPRINT1("IsBootViaEfi: no 'UEFI Internal' adapter found: BIOS machine\n");
+        return FALSE;
+    }
+
+Fallback:
+    /*
+     * Degenerate case: the MultifunctionAdapter tree is entirely absent
+     * (e.g. the firmware configuration was not mirrored into the registry).
+     * Under legacy BIOS, FreeLoader detects the hard disks via the INT13
+     * BIOS services and stores their configuration data in the registry
+     * tree under ...\DiskController\*\DiskPeripheral\*. Under (U)EFI it
+     * does not, so the absence of this tree is used as a last-resort
+     * heuristic.
+     */
+    {
+        ULONG AdapterCount, ControllerCount;
+        WCHAR Name[120];
+        BOOLEAN BiosDiskFound = FALSE;
+
+#define ROOT_NAME L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\MultifunctionAdapter"
+
+        for (AdapterCount = 0; AdapterCount < 16 && !BiosDiskFound; ++AdapterCount)
+        {
+            RtlStringCchPrintfW(Name, ARRAYSIZE(Name),
+                                L"%s\\%lu\\DiskController",
+                                ROOT_NAME, AdapterCount);
+            Status = RtlCheckRegistryKey(RTL_REGISTRY_ABSOLUTE, Name);
+            if (!NT_SUCCESS(Status))
+                continue;
+
+            for (ControllerCount = 0; ControllerCount < 16 && !BiosDiskFound; ++ControllerCount)
+            {
+                RtlStringCchPrintfW(Name, ARRAYSIZE(Name),
+                                    L"%s\\%lu\\DiskController\\%lu\\DiskPeripheral\\0",
+                                    ROOT_NAME, AdapterCount, ControllerCount);
+                Status = RtlCheckRegistryKey(RTL_REGISTRY_ABSOLUTE, Name);
+                if (NT_SUCCESS(Status))
+                    BiosDiskFound = TRUE;
+            }
+        }
+
+#undef ROOT_NAME
+
+        DPRINT1("IsBootViaEfi: fallback: legacy BIOS disk configuration %s\n",
+                BiosDiskFound ? "found: BIOS machine" : "not found: assuming UEFI machine");
+        return !BiosDiskFound;
+    }
 }
 
 // NTSTATUS
@@ -1088,14 +1290,25 @@ InitializeSetup(
     DPRINT1("SourceRootDir (2): '%wZ'\n", &pSetupData->SourceRootDir);
 
     /* Retrieve the target machine architecture type */
-    // FIXME: This should be determined at runtime!!
     // FIXME: Allow for (pre-)installing on an architecture
     //        different from the current one?
 #if defined(SARCH_XBOX)
     pSetupData->ArchType = ARCH_Xbox;
 // #elif defined(SARCH_PC98)
-#else // TODO: Arc, UEFI
-    pSetupData->ArchType = (IsNEC_98 ? ARCH_NEC98x86 : ARCH_PcAT);
+#else
+    if (IsBootViaEfi())
+    {
+        /* The machine was booted via (U)EFI */
+        pSetupData->ArchType = ARCH_Efi;
+    }
+    else
+    {
+        pSetupData->ArchType = (IsNEC_98 ? ARCH_NEC98x86 : ARCH_PcAT);
+    }
+    DPRINT1("InitializeSetup: machine architecture type = %lu (%s)\n",
+            pSetupData->ArchType,
+            pSetupData->ArchType == ARCH_Efi ? "UEFI" :
+            pSetupData->ArchType == ARCH_PcAT ? "BIOS PC-AT" : "other");
 #endif
 
     return ERROR_SUCCESS;

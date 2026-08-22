@@ -204,6 +204,15 @@ TuiDrawMenu(
     /* Draw the backdrop */
     UiDrawBackdrop(UiGetScreenHeight());
 
+#ifdef UEFIBOOT
+    /* When the machine has been booted via (U)EFI, display a colored
+     * indicator tag in the top-left corner of the screen. */
+    if (UiIsBootViaUefi())
+    {
+        UiDrawText(1, 1, "UEFI", ATTR(COLOR_LIGHTGREEN, COLOR_BLACK));
+    }
+#endif
+
     /* Draw the menu box */
     TuiDrawMenuBox(MenuInfo);
 

@@ -734,7 +734,11 @@ FdoIoctlDiskSetDriveLayout(
 
     PartMgrReleaseLayoutLock(FdoExtension);
 
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
     IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+
+    /* PartMgrNotifyMountMgrOfPartitions(FdoExtension); -- DEADLOCK SUSPECT: disabled, see reactos.md 0065 notes */
 
     // notify everyone that the disk layout has changed
     TARGET_DEVICE_CUSTOM_NOTIFICATION notification;
@@ -826,13 +830,13 @@ FdoIoctlDiskSetDriveLayoutEx(
         status = IoWritePartitionTableEx(FdoExtension->LowerDevice, layoutEx);
         if (NT_SUCCESS(status))
         {
-            // set updated partition numbers
-            for (UINT32 i = 0; i < layoutEx->PartitionCount; i++)
-            {
-                PPARTITION_INFORMATION_EX part = &layoutEx->PartitionEntry[i];
-
-                part->PartitionNumber = layoutEx->PartitionEntry[i].PartitionNumber;
-            }
+            /* PartMgrUpdatePartitionDevices() assigned the partition numbers in
+             * our private copy, not in the caller's buffer. This is a
+             * METHOD_BUFFERED IOCTL and Irp->IoStatus.Information is set below,
+             * so what the caller gets back is the system buffer: copy the
+             * updated layout into it, otherwise the caller reads back the
+             * numbers it passed in, which are 0 for newly created partitions. */
+            RtlCopyMemory(layoutUser, layoutEx, layoutSize);
         }
     }
 
@@ -855,7 +859,15 @@ FdoIoctlDiskSetDriveLayoutEx(
 
     PartMgrReleaseLayoutLock(FdoExtension);
 
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
     IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+
+    /* Proactively register the new volumes with MountMgr so callers see a
+     * fully-registered volume (MOUNTDEV name, drive-letter eligibility)
+     * when this IOCTL returns, instead of racing the async interface
+     * arrival. Best-effort: ignore failures. */
+    /* PartMgrNotifyMountMgrOfPartitions(FdoExtension); -- DEADLOCK SUSPECT: disabled, see reactos.md 0065 notes */
 
     // notify everyone that the disk layout has changed
     TARGET_DEVICE_CUSTOM_NOTIFICATION notification;
@@ -888,7 +900,31 @@ FdoIoctlDiskUpdateProperties(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
     IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Synchronous variant of FdoIoctlDiskUpdateProperties: blocks until PnP
+ * has re-enumerated the bus and started every new partition PDO.  This
+ * ensures the partition symlink and volume device interface exist before
+ * the caller (Setup FormatPartition) tries to open the volume.
+ */
+static
+CODE_SEG("PAGE")
+NTSTATUS
+FdoIoctlDiskUpdatePartitionDeviceRelations(
+    _In_ PFDO_EXTENSION FdoExtension,
+    _In_ PIRP Irp)
+{
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(Irp);
+
+    IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO,
+                                           BusRelations);
     return STATUS_SUCCESS;
 }
 
@@ -914,6 +950,8 @@ FdoIoctlDiskCreateDisk(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
     IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     return status;
 }
@@ -936,6 +974,8 @@ FdoIoctlDiskDeleteDriveLayout(
     FdoExtension->LayoutValid = FALSE;
     PartMgrReleaseLayoutLock(FdoExtension);
 
+    /* Blocks until PnP starts new partition PDOs so the volume is
+     * openable when this IOCTL returns. */
     IoInvalidateDeviceRelations(FdoExtension->PhysicalDiskDO, BusRelations);
     return status;
 }
@@ -1068,11 +1108,14 @@ FdoHandleDeviceRelations(
         // now fill the DeviceRelations structure
         TRACE("Reporting %u partitions\n", FdoExtension->EnumeratedPartitionsTotal);
 
+        /* DEVICE_RELATIONS already embeds one object pointer, but the count is
+         * unsigned: subtracting one from a disk with no enumerated partitions
+         * wraps to 0xFFFFFFFF and asks for ~32 GB. Size from the flexible
+         * member instead, which is correct for a count of zero. */
         PDEVICE_RELATIONS deviceRelations =
             ExAllocatePoolWithTag(PagedPool,
-                                  sizeof(DEVICE_RELATIONS)
-                                  + sizeof(PDEVICE_OBJECT)
-                                  * (FdoExtension->EnumeratedPartitionsTotal - 1),
+                                  FIELD_OFFSET(DEVICE_RELATIONS,
+                                               Objects[FdoExtension->EnumeratedPartitionsTotal]),
                                   TAG_PARTMGR);
 
         if (!deviceRelations)
@@ -1281,6 +1324,10 @@ PartMgrDeviceControl(
 
         case IOCTL_DISK_UPDATE_PROPERTIES:
             status = FdoIoctlDiskUpdateProperties(fdoExtension, Irp);
+            break;
+
+        case IOCTL_DISK_UPDATE_PARTITION_DEVICE_RELATIONS:
+            status = FdoIoctlDiskUpdatePartitionDeviceRelations(fdoExtension, Irp);
             break;
 
         case IOCTL_DISK_CREATE_DISK:

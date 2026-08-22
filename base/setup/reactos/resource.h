@@ -54,6 +54,7 @@
 #define IDC_PARTDELETE       2045
 #define IDC_DEVICEDRIVER     2046
 #define IDC_PARTMOREOPTS     2047
+#define IDC_PARTAUTO         2048
 
 #define IDD_SUMMARYPAGE      2050
 #define IDC_INSTALLTYPE      2051

@@ -863,6 +863,11 @@ FormatPartition(
 
     ASSERT(PartEntry->IsPartitioned && PartEntry->PartitionNumber != 0);
 
+    DPRINT1("FormatPartition: partition %lu on disk %lu (%I64u bytes), file system %S, %s\n",
+            PartEntry->PartitionNumber, DiskEntry->DiskNumber,
+            GetPartEntrySizeInBytes(PartEntry), FileSystemName,
+            QuickFormat ? "quick format" : "full format");
+
     if (!FileSystemName || !*FileSystemName)
     {
         DPRINT1("No file system specified\n");
@@ -921,6 +926,23 @@ FormatPartition(
         DPRINT1("WritePartitions(disk %lu) failed, Status 0x%08lx\n",
                 DiskEntry->DiskNumber, Status);
         return STATUS_PARTITION_FAILURE;
+    }
+
+    /*
+     * Re-resolve the volume device name now that the partition exists.
+     * During earlier enumeration, InitVolumeDeviceName() failed because
+     * the partition hadn't been written yet.  Now the partition symlink
+     * (\Device\HarddiskN\PartitionM) will appear once PnP finishes
+     * starting the PDO; the retry loop inside InitVolumeDeviceName()
+     * waits for it.
+     */
+    PartEntry->Volume->Info.DeviceName[0] = UNICODE_NULL;
+    Status = InitVolumeDeviceName(PartEntry->Volume, NULL);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("InitVolumeDeviceName() after WritePartitions() failed, "
+                "Status 0x%08lx\n", Status);
+        return Status;
     }
 
     /* We must have an associated volume now */
@@ -1188,7 +1210,16 @@ NextFormat:
             {
                 Volume = SystemVolume;
 
-                if (Volume->FormatState == Unformatted)
+                /*
+                 * Format the system volume when it is unformatted, or when it
+                 * is an existing GPT ESP that MountVolume classified as
+                 * UnknownFormat (no MBR type byte for the FAT-type heuristic).
+                 * ESPs must be FAT/FAT32 before the UEFI bootloader is written.
+                 */
+                if (Volume->FormatState == Unformatted ||
+                    (Volume->FormatState == UnknownFormat &&
+                     Volume->PartEntry &&
+                     IsEfiSystemPartition(Volume->PartEntry)))
                 {
                     // TODO: Should we let the user use a custom file system,
                     // or should we always use FAT(32) for it?

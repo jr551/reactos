@@ -28,6 +28,25 @@ DefaultDestDir = 12
 [GenericMfg]
 %GEN_SCSIADAPTER.DeviceDesc% = NO_DRV,,GEN_SCSIADAPTER
 %PCI\VEN_104B&CC_0100.DeviceDesc% = BusLogic_Inst,PCI\VEN_104B&CC_0100
+%PCI\VEN_1AF4&DEV_1001.DeviceDesc% = VirtIo_Inst,PCI\VEN_1AF4&DEV_1001
+
+;---------------------------- VIOSTOR DRIVER -----------------------------
+
+[VirtIo_Inst.NT]
+CopyFiles = VirtIo_CopyFiles.NT
+
+[VirtIo_CopyFiles.NT]
+viostor.sys
+
+[VirtIo_Inst.NT.Services]
+AddService = viostor, 0x00000002, VirtIo_Service_Inst
+
+[VirtIo_Service_Inst]
+ServiceType   = 0
+StartType     = 0
+ErrorControl  = 1
+ServiceBinary = %12%\viostor.sys
+LoadOrderGroup = SCSI Miniport
 
 ;--------------------------- SCSIPORT DRIVER ----------------------------
 
@@ -80,6 +99,7 @@ GenericMfg = "(Standard SCSI and RAID controllers)"
 GEN_SCSIADAPTER.DeviceDesc = "SCSI/RAID Host Controller"
 
 PCI\VEN_104B&CC_0100.DeviceDesc = "BusLogic SCSI Controller"
+PCI\VEN_1AF4&DEV_1001.DeviceDesc = "VirtIO Block Device"
 
 [Strings.0404]
 SCSIClassName = "SCSI / RAID 控制器"

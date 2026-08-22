@@ -58,6 +58,9 @@ typedef struct _VOLENTRY
     // };
 } VOLENTRY, *PVOLENTRY;
 
+/* Flag set in VOLENTRY::New when a partition/volume is created automatically */
+#define VOLUME_NEW_AUTOCREATE   0x80
+
 typedef struct _PARTENTRY
 {
     LIST_ENTRY ListEntry;
@@ -70,7 +73,12 @@ typedef struct _PARTENTRY
     ULARGE_INTEGER SectorCount;
 
     BOOLEAN BootIndicator;  // NOTE: See comment for the PARTLIST::SystemPartition member.
-    UCHAR PartitionType;
+    UCHAR PartitionType;    // Valid for MBR-partitioned disks (see the DiskEntry->DiskStyle member).
+    /* GPT-specific data, valid for GPT-partitioned disks
+     * (see the DiskEntry->DiskStyle member). */
+    GUID PartitionGuid;     // GPT partition type GUID (e.g. PARTITION_SYSTEM_GUID for an ESP).
+    GUID PartitionId;       // GPT partition unique ID.
+    ULONGLONG Attributes;   // GPT partition attributes.
     ULONG OnDiskPartitionNumber; /* Enumerated partition number (primary partitions first, excluding the extended partition container, then the logical partitions) */
     ULONG PartitionNumber;       /* Current partition number, only valid for the currently running NTOS instance */
     ULONG PartitionIndex;        /* Index in the LayoutBuffer->PartitionEntry[] cached array of the corresponding DiskEntry */
@@ -140,11 +148,10 @@ typedef struct _DISKENTRY
 
     UNICODE_STRING DriverName;
 
-    PDRIVE_LAYOUT_INFORMATION LayoutBuffer;
-    // TODO: When adding support for GPT disks:
-    // Use PDRIVE_LAYOUT_INFORMATION_EX which indicates whether
-    // the disk is MBR, GPT, or unknown (uninitialized).
-    // Depending on the style, either use the MBR or GPT partition info.
+    PDRIVE_LAYOUT_INFORMATION_EX LayoutBuffer;
+    // NOTE: The extended layout structure DRIVE_LAYOUT_INFORMATION_EX
+    // indicates whether the disk is MBR, GPT, or unknown (uninitialized);
+    // depending on the style, either the MBR or GPT partition info is used.
 
     LIST_ENTRY PrimaryPartListHead; /* List of primary partitions */
     LIST_ENTRY LogicalPartListHead; /* List of logical partitions (Valid only for MBR-partitioned disks) */
@@ -358,6 +365,51 @@ CreatePartition(
     _In_opt_ ULONGLONG SizeBytes,
     _In_opt_ ULONG_PTR PartitionInfo);
 
+/**
+ * @brief
+ * Creates a new GPT partition with the given partition type GUID
+ * (e.g. PARTITION_SYSTEM_GUID to create an EFI System Partition).
+ * The disk of the partition entry must be GPT-partitioned.
+ *
+ * @return  TRUE on success, FALSE otherwise.
+ **/
+BOOLEAN
+NTAPI
+CreateGptPartition(
+    _In_ PPARTLIST List,
+    _Inout_ PPARTENTRY PartEntry,
+    _In_opt_ ULONGLONG SizeBytes,
+    _In_ LPCGUID PartitionType);
+
+/**
+ * @brief
+ * Checks whether the given partition is an EFI System Partition (ESP),
+ * i.e. a GPT partition of type PARTITION_SYSTEM_GUID.
+ **/
+BOOLEAN
+NTAPI
+IsEfiSystemPartition(
+    _In_ PPARTENTRY PartEntry);
+
+/**
+ * @brief
+ * Initializes an uninitialized (RAW) disk as a GPT-partitioned disk:
+ * writes a protective MBR and the primary/backup GPT headers (with no
+ * partition entries yet), and prepares the partition list of the disk
+ * so that partitions (including an ESP) can be created on it.
+ * The GPT header and entry writes are performed by the partition manager
+ * via the IOCTL_DISK_CREATE_DISK and IOCTL_DISK_SET_DRIVE_LAYOUT_EX
+ * device controls, reusing the kernel GPT writer (IoCreateDisk and
+ * IoWritePartitionTableEx).
+ *
+ * @return  TRUE on success, FALSE otherwise.
+ **/
+BOOLEAN
+NTAPI
+InitializeDiskGpt(
+    _In_ PPARTLIST List,
+    _Inout_ PDISKENTRY DiskEntry);
+
 BOOLEAN
 NTAPI
 DeletePartition(
@@ -381,6 +433,11 @@ SetActivePartition(
 NTSTATUS
 WritePartitions(
     IN PDISKENTRY DiskEntry);
+
+NTSTATUS
+InitVolumeDeviceName(
+    _Inout_ PVOLENTRY Volume,
+    _In_opt_ PCWSTR AltDeviceName);
 
 BOOLEAN
 WritePartitionsToDisk(

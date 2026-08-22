@@ -189,7 +189,8 @@ static int virtqueue_add_buf_packed(
     BUG_ON(descs_used == 0);
     BUG_ON(id >= vq->packed.vring.num);
 
-    if (va_indirect && vq->num_free > 0) {
+    if (va_indirect && descs_used <= virtio_get_indirect_page_capacity() &&
+        vq->num_free > 0) {
         desc = va_indirect;
         for (i = 0; i < descs_used; i++) {
             desc[i].flags = i < out ? 0 : VRING_DESC_F_WRITE;
@@ -293,10 +294,22 @@ static int virtqueue_add_buf_packed(
 
 static void detach_buf_packed(struct virtqueue_packed *vq, unsigned int id)
 {
-    struct vring_desc_state_packed *state = &vq->packed.desc_state[id];
+    struct vring_desc_state_packed *state;
+
+    if (id >= vq->packed.vring.num) {
+        BAD_RING(vq, "id %u out of range\n", id);
+        return;
+    }
+
+    state = &vq->packed.desc_state[id];
 
     /* Clear data ptr. */
     state->data = NULL;
+
+    if (state->last >= vq->packed.vring.num) {
+        BAD_RING(vq, "last descriptor %u out of range\n", state->last);
+        return;
+    }
 
     vq->packed.desc_state[state->last].next = (u16)vq->free_head;
     vq->free_head = id;
@@ -456,7 +469,7 @@ static bool virtqueue_enable_cb_delayed_packed(struct virtqueue *_vq)
 static BOOLEAN virtqueue_is_interrupt_enabled_packed(struct virtqueue *_vq)
 {
     struct virtqueue_packed *vq = packedvq(_vq);
-    return vq->packed.event_flags_shadow & VRING_PACKED_EVENT_FLAG_DISABLE;
+    return vq->packed.event_flags_shadow != VRING_PACKED_EVENT_FLAG_DISABLE;
 }
 
 static void virtqueue_shutdown_packed(struct virtqueue *_vq)
@@ -615,6 +628,7 @@ struct virtqueue *vring_new_virtqueue_packed(
     vq->vq.used_va = (u8 *)vq->vq.avail_va + sizeof(struct vring_packed_desc_event);
 
     /* initialize the ring */
+    RtlZeroMemory(pages, vring_size_packed(num, vring_align));
     vq->packed.vring.num = num;
     vq->packed.vring.desc = pages;
     vq->packed.vring.driver = vq->vq.avail_va;

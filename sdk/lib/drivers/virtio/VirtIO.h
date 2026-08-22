@@ -1,6 +1,8 @@
 #ifndef _LINUX_VIRTIO_H
 #define _LINUX_VIRTIO_H
 
+#include "osdep.h"
+
 #include "virtio_ring.h"
 
 #define scatterlist VirtIOBufferDescriptor

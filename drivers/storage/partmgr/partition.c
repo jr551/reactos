@@ -96,6 +96,32 @@ PartitionCreateDevice(
     // The device is initialized
     partitionDevice->Flags &= ~DO_DEVICE_INITIALIZING;
 
+    /* Create the partition symlink immediately so that it is available
+     * when the IOCTL returns, blocking until PnP starts new partition PDOs
+     * so the volume is openable at that point. The symlink is just a name
+     * mapping and does not depend on the device being "started". */
+    {
+        PFDO_EXTENSION fdoExt = FDObject->DeviceExtension;
+        WCHAR symBuf[64];
+        UNICODE_STRING symLink;
+        NTSTATUS symStatus;
+        _swprintf(symBuf, PartitionSymLinkFormat,
+                  fdoExt->DiskData.DeviceNumber, PdoNumber);
+        if (RtlCreateUnicodeString(&symLink, symBuf))
+        {
+            symStatus = IoCreateSymbolicLink(&symLink, &deviceName);
+            if (NT_SUCCESS(symStatus))
+            {
+                partExt->SymlinkCreated = TRUE;
+            }
+            else
+            {
+                ERR("IoCreateSymbolicLink(%wZ) failed with status 0x%08lx\n",
+                    &symLink, symStatus);
+            }
+            RtlFreeUnicodeString(&symLink);
+        }
+    }
     *PDO = partitionDevice;
     return status;
 }
@@ -118,21 +144,27 @@ PartitionHandleStartDevice(
     _swprintf(nameBuf, PartitionSymLinkFormat,
         fdoExtension->DiskData.DeviceNumber, PartExt->DetectedNumber);
 
-    if (!RtlCreateUnicodeString(&partitionSymlink, nameBuf))
+    NTSTATUS status;
+
+    /* Skip symlink creation if already done at device creation time */
+    if (!PartExt->SymlinkCreated)
     {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        if (!RtlCreateUnicodeString(&partitionSymlink, nameBuf))
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        status = IoCreateSymbolicLink(&partitionSymlink, &PartExt->DeviceName);
+
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
+
+        PartExt->SymlinkCreated = TRUE;
+
+        INFO("Symlink created %wZ -> %wZ\n", &partitionSymlink, &PartExt->DeviceName);
     }
-
-    NTSTATUS status = IoCreateSymbolicLink(&partitionSymlink, &PartExt->DeviceName);
-
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
-
-    PartExt->SymlinkCreated = TRUE;
-
-    INFO("Symlink created %wZ -> %wZ\n", &partitionSymlink, &PartExt->DeviceName);
 
     // Our partition device will have two interfaces:
     // GUID_DEVINTERFACE_PARTITION and GUID_DEVINTERFACE_VOLUME
@@ -1033,4 +1065,92 @@ PartitionHandleDeviceControl(
     Irp->IoStatus.Status = status;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
+}
+
+/*
+ * @name PartitionNotifyMountMgr
+ *
+ * Proactively tell MountMgr a new volume arrived, instead of waiting for the
+ * asynchronous GUID_DEVINTERFACE_VOLUME arrival notification. Best-effort:
+ * failure degrades to today's asynchronous behavior. Called after the
+ * synchronous BusRelations invalidate in the SET_DRIVE_LAYOUT paths so that
+ * Setup sees a fully registered volume when the IOCTL returns.
+ */
+CODE_SEG("PAGE")
+NTSTATUS
+PartitionNotifyMountMgr(
+    _In_ PUNICODE_STRING DeviceName)
+{
+    UNICODE_STRING MountMgr;
+    PDEVICE_OBJECT DeviceObject;
+    PFILE_OBJECT FileObject = NULL;
+    PMOUNTMGR_TARGET_NAME Target;
+    ULONG InputSize;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+
+    RtlInitUnicodeString(&MountMgr, MOUNTMGR_DEVICE_NAME);
+    Status = IoGetDeviceObjectPointer(&MountMgr,
+                                      FILE_READ_ATTRIBUTES,
+                                      &FileObject,
+                                      &DeviceObject);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    InputSize = FIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) + DeviceName->Length;
+    Target = ExAllocatePoolWithTag(PagedPool, InputSize, TAG_PARTMGR);
+    if (!Target)
+    {
+        ObDereferenceObject(FileObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(Target, sizeof(*Target));
+    Target->DeviceNameLength = DeviceName->Length;
+    RtlCopyMemory(Target->DeviceName,
+                  DeviceName->Buffer,
+                  DeviceName->Length);
+
+    Status = IssueSyncIoControlRequest(IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION,
+                                       DeviceObject,
+                                       Target,
+                                       InputSize,
+                                       NULL,
+                                       0,
+                                       FALSE);
+
+    ExFreePoolWithTag(Target, TAG_PARTMGR);
+    ObDereferenceObject(FileObject);
+    return Status;
+}
+
+/*
+ * @name PartMgrNotifyMountMgrOfPartitions
+ *
+ * Best-effort sweep: notify MountMgr of every enumerated partition that has
+ * a live symlink, so the volumes are fully registered when the calling
+ * IOCTL returns. See PartitionNotifyMountMgr.
+ */
+CODE_SEG("PAGE")
+VOID
+PartMgrNotifyMountMgrOfPartitions(
+    _In_ PFDO_EXTENSION FdoExtension)
+{
+    PSINGLE_LIST_ENTRY Entry;
+
+    PAGED_CODE();
+
+    for (Entry = FdoExtension->PartitionList.Next;
+         Entry != NULL;
+         Entry = Entry->Next)
+    {
+        PPARTITION_EXTENSION PartExt = CONTAINING_RECORD(Entry,
+                                                         PARTITION_EXTENSION,
+                                                         ListEntry);
+        if (PartExt->SymlinkCreated && PartExt->IsEnumerated)
+        {
+            PartitionNotifyMountMgr(&PartExt->DeviceName);
+        }
+    }
 }

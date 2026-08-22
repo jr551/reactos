@@ -48,7 +48,8 @@ CreateFileSystemList(
     IN SHORT Left,
     IN SHORT Top,
     IN BOOLEAN ForceFormat,
-    IN PCWSTR SelectFileSystem);
+    IN PCWSTR SelectFileSystem,
+    IN BOOLEAN FatOnly);
 
 VOID
 DestroyFileSystemList(

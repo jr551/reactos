@@ -81,9 +81,6 @@ static enum {
     PartTypeExtended // MBR-disk container
 } PartCreateType = PartTypeData;
 
-/* Flag set in VOLENTRY::New when a partition/volume is created automatically */
-#define VOLUME_NEW_AUTOCREATE   0x80
-
 /* List of supported file systems for the partition to be formatted */
 static PFILE_SYSTEM_LIST FileSystemList = NULL;
 
@@ -1532,6 +1529,173 @@ IsMediumLargeEnough(
 }
 
 
+/**
+ * @brief
+ * On (U)EFI machines, initializes an uninitialized (RAW) disk as a
+ * GPT-partitioned disk, automatically creating an EFI System Partition
+ * (ESP) at the beginning of the usable area (like the Windows Setup does).
+ * The partition list of the disk is rebuilt in the process.
+ *
+ * @return  TRUE on success (or if no initialization was needed),
+ *          FALSE otherwise.
+ **/
+static
+BOOLEAN
+InitializeDiskForUefi(
+    _In_ PPARTENTRY PartEntry)
+{
+    PDISKENTRY DiskEntry;
+    PPARTENTRY FreeRegion;
+    PLIST_ENTRY Entry;
+
+    /* Nothing to do on non-UEFI machines or on already-initialized disks */
+    if (USetupData.ArchType != ARCH_Efi)
+        return TRUE;
+    if (!PartEntry || !PartEntry->DiskEntry)
+        return TRUE;
+    if (PartEntry->DiskEntry->DiskStyle != PARTITION_STYLE_RAW)
+        return TRUE;
+
+    DiskEntry = PartEntry->DiskEntry;
+
+    DPRINT1("InitializeDiskForUefi: initializing disk %lu as GPT with ESP\n",
+            DiskEntry->DiskNumber);
+
+    /* Initialize the disk as GPT (this creates the ESP as well) */
+    if (!InitializeDiskGpt(PartitionList, DiskEntry))
+        return FALSE;
+
+    /*
+     * The partition list of the disk has been rebuilt; re-select the
+     * remaining unpartitioned space (after the ESP) as the current entry.
+     */
+    FreeRegion = NULL;
+    for (Entry = DiskEntry->PrimaryPartListHead.Flink;
+         Entry != &DiskEntry->PrimaryPartListHead;
+         Entry = Entry->Flink)
+    {
+        PartEntry = CONTAINING_RECORD(Entry, PARTENTRY, ListEntry);
+        if (!PartEntry->IsPartitioned)
+        {
+            FreeRegion = PartEntry;
+            break;
+        }
+    }
+
+    if (!FreeRegion)
+        return FALSE;
+
+    CurrentPartition = FreeRegion;
+
+    return TRUE;
+}
+
+/**
+ * @brief
+ * Automatically partitions the whole selected disk and selects the
+ * resulting installation partition:
+ *  - On (U)EFI machines: initializes an uninitialized disk as GPT and
+ *    automatically creates the EFI System Partition (ESP) plus one system
+ *    partition using all the remaining space (like the Windows Setup
+ *    "Auto" partitioning does on UEFI machines).
+ *  - On BIOS machines: creates one partition using all the free space
+ *    of the disk.
+ * The disk must be unpartitioned (or have some free space left); if the
+ * whole disk is already partitioned, an error is displayed.
+ *
+ * @return  TRUE on success (InstallPartition is set), FALSE otherwise.
+ **/
+static
+BOOLEAN
+AutoPartitionSelectedDisk(
+    _In_ PINPUT_RECORD Ir)
+{
+    PDISKENTRY DiskEntry;
+    PPARTENTRY FreeRegion;
+    PPARTENTRY PartEntry;
+    PLIST_ENTRY Entry;
+
+    if (!CurrentPartition || !CurrentPartition->DiskEntry)
+        return FALSE;
+
+    DiskEntry = CurrentPartition->DiskEntry;
+
+    DPRINT1("AutoPartitionSelectedDisk: disk %lu, disk style %lu, arch %lu\n",
+            DiskEntry->DiskNumber, DiskEntry->DiskStyle, USetupData.ArchType);
+
+    /* On UEFI machines, initialize an uninitialized disk as GPT: this
+     * automatically creates the ESP (see InitializeDiskGpt()). MBR disks
+     * cannot be booted on UEFI machines (they have no ESP), so refuse. */
+    if (USetupData.ArchType == ARCH_Efi)
+    {
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_MBR)
+        {
+            DPRINT1("AutoPartitionSelectedDisk: refusing to auto-partition an MBR disk on a UEFI machine\n");
+            MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+            return FALSE;
+        }
+
+        if (DiskEntry->DiskStyle == PARTITION_STYLE_RAW)
+        {
+            if (!InitializeDiskForUefi(CurrentPartition))
+            {
+                MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+                return FALSE;
+            }
+            DPRINT1("AutoPartitionSelectedDisk: initialized disk %lu as GPT (ESP created)\n",
+                    DiskEntry->DiskNumber);
+        }
+    }
+
+    /* Find the first unpartitioned region of the disk */
+    FreeRegion = NULL;
+    for (Entry = DiskEntry->PrimaryPartListHead.Flink;
+         Entry != &DiskEntry->PrimaryPartListHead;
+         Entry = Entry->Flink)
+    {
+        PartEntry = CONTAINING_RECORD(Entry, PARTENTRY, ListEntry);
+        if (!PartEntry->IsPartitioned)
+        {
+            FreeRegion = PartEntry;
+            break;
+        }
+    }
+
+    /* The whole disk is already partitioned: refuse */
+    if (!FreeRegion)
+    {
+        DPRINT1("AutoPartitionSelectedDisk: no free space left on disk %lu\n",
+                DiskEntry->DiskNumber);
+        MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+        return FALSE;
+    }
+
+    /* Create the installation partition on the whole free space */
+    DPRINT1("AutoPartitionSelectedDisk: creating the installation partition on disk %lu\n",
+            DiskEntry->DiskNumber);
+    if (!CreatePartition(PartitionList, FreeRegion, 0ULL, 0))
+    {
+        DPRINT1("AutoPartitionSelectedDisk: CreatePartition() failed on disk %lu\n",
+                DiskEntry->DiskNumber);
+        MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+        return FALSE;
+    }
+    ASSERT(FreeRegion->IsPartitioned);
+    if (FreeRegion->Volume)
+        FreeRegion->Volume->New |= VOLUME_NEW_AUTOCREATE;
+
+    /* Verify the target medium size */
+    if (!IsMediumLargeEnough(GetPartEntrySizeInBytes(FreeRegion)))
+    {
+        MUIDisplayError(ERROR_INSUFFICIENT_PARTITION_SIZE, Ir, POPUP_WAIT_ANY_KEY,
+                        USetupData.RequiredPartitionDiskSpace);
+        return FALSE; /* Let the user select another partition */
+    }
+
+    InstallPartition = FreeRegion;
+    return TRUE;
+}
+
 /*
  * Displays the SelectPartitionPage.
  *
@@ -1677,7 +1841,7 @@ SelectPartitionPage(PINPUT_RECORD Ir)
                     uID = STRING_INSTALLCREATELOGICAL;
             }
         }
-        CONSOLE_SetStatusText(MUIGetString(uID));
+        CONSOLE_SetStatusText("%s   A = Auto partition", MUIGetString(uID));
 
         CONSOLE_ConInKey(Ir);
 
@@ -1714,8 +1878,11 @@ SelectPartitionPage(PINPUT_RECORD Ir)
              * Check whether the user wants to install ReactOS on a disk that
              * is not recognized by the computer's firmware and if so, display
              * a warning since such disks may not be bootable.
+             * (On UEFI machines, disks are not discovered via the legacy BIOS
+             * services, so this check does not apply.)
              */
-            if (CurrentPartition->DiskEntry->MediaType == FixedMedia &&
+            if (USetupData.ArchType != ARCH_Efi &&
+                CurrentPartition->DiskEntry->MediaType == FixedMedia &&
                 !CurrentPartition->DiskEntry->BiosFound)
             {
                 PopupError("The disk you have selected for installing ReactOS\n"
@@ -1729,9 +1896,31 @@ SelectPartitionPage(PINPUT_RECORD Ir)
 
             goto CreateInstallPartition;
         }
+        else if (Ir->Event.KeyEvent.wVirtualKeyCode == 'A')  /* A */
+        {
+            ASSERT(CurrentPartition);
+
+            /* Automatically partition the whole selected disk:
+             * on UEFI machines this creates the GPT layout with an ESP,
+             * on BIOS machines one partition using the whole disk. */
+            if (AutoPartitionSelectedDisk(Ir))
+            {
+                ASSERT(InstallPartition && InstallPartition->IsPartitioned);
+                return START_PARTITION_OPERATIONS_PAGE;
+            }
+            return SELECT_PARTITION_PAGE;
+        }
         else if (Ir->Event.KeyEvent.wVirtualKeyCode == 'C')  /* C */
         {
             ASSERT(CurrentPartition);
+
+            /* On UEFI machines, initialize a raw disk as GPT and
+             * automatically create an EFI System Partition (ESP) */
+            if (!InitializeDiskForUefi(CurrentPartition))
+            {
+                MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+                return SELECT_PARTITION_PAGE;
+            }
 
             Error = PartitionCreateChecks(CurrentPartition, 0ULL, 0);
             if (Error != NOT_AN_ERROR)
@@ -1749,6 +1938,10 @@ SelectPartitionPage(PINPUT_RECORD Ir)
 
             /* Don't create an extended partition within a logical partition */
             if (CurrentPartition->LogicalPartition)
+                continue;
+
+            /* GPT-partitioned disks have no extended partitions */
+            if (CurrentPartition->DiskEntry->DiskStyle == PARTITION_STYLE_GPT)
                 continue;
 
             Error = PartitionCreateChecks(CurrentPartition, 0ULL, PARTITION_EXTENDED);
@@ -1807,6 +2000,14 @@ SelectPartitionPage(PINPUT_RECORD Ir)
 CreateInstallPartition:
     ASSERT(CurrentPartition);
     ASSERT(!IsContainerPartition(CurrentPartition->PartitionType));
+
+    /* On UEFI machines, initialize a raw disk as GPT and
+     * automatically create an EFI System Partition (ESP) */
+    if (!InitializeDiskForUefi(CurrentPartition))
+    {
+        MUIDisplayError(ERROR_WARN_PARTITION, Ir, POPUP_WAIT_ANY_KEY);
+        return SELECT_PARTITION_PAGE;
+    }
 
     /* Create the partition if the selected region is empty */
     if (!CurrentPartition->IsPartitioned)
@@ -2447,11 +2648,20 @@ Restart:
     {
         /* By default select the "FAT" file system */
         DefaultFs = L"FAT";
+
+        /* EFI System Partitions are normally formatted as FAT32 */
+        if (Volume == SystemVolume && IsEfiSystemPartition(PartEntry))
+            DefaultFs = L"FAT32";
     }
 
     /* Create the file system list */
     // TODO: Display only the FSes compatible with the selected volume!
-    FileSystemList = CreateFileSystemList(6, 26, ForceFormat, DefaultFs);
+    /* EFI System Partitions must use a FAT file system: only offer
+     * FAT/FAT32 for them (the UEFI firmware cannot boot from anything
+     * else on the ESP). */
+    FileSystemList = CreateFileSystemList(6, 26, ForceFormat, DefaultFs,
+                                          (Volume == SystemVolume &&
+                                           IsEfiSystemPartition(PartEntry)));
     if (!FileSystemList)
     {
         /* FIXME: show an error dialog */
@@ -2515,6 +2725,9 @@ Restart:
             else
             {
                 /* Format this volume */
+                DPRINT1("SelectFileSystemPage: volume '%S' (partition %lu, disk %lu) will be formatted as %S\n",
+                        Volume->Info.DeviceName, PartEntry->PartitionNumber,
+                        DiskEntry->DiskNumber, FileSystemList->Selected->FileSystem);
                 return FSVOL_DOIT;
             }
         }
@@ -3429,6 +3642,14 @@ BootLoaderSelectPage(PINPUT_RECORD Ir)
     if (RepairUpdateFlag)
     {
         USetupData.BootLoaderLocation = 0;
+        goto Quit;
+    }
+
+    /* On UEFI machines, the bootloader is always installed on the
+     * EFI System Partition (ESP); there is no MBR/VBR choice. */
+    if (USetupData.ArchType == ARCH_Efi)
+    {
+        USetupData.BootLoaderLocation = 2;
         goto Quit;
     }
 

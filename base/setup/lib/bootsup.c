@@ -918,6 +918,386 @@ InstallBootloaderFiles(
     return STATUS_SUCCESS;
 }
 
+/*
+ * UEFI boot entry structures, as defined by the UEFI specification
+ * (see "EFI_LOAD_OPTION" and the device path nodes; the in-tree edk2
+ * headers sdk/include/reactos/edk2/{UefiSpec.h,DevicePath.h} define the
+ * corresponding constants and the HARDDRIVE_DEVICE_PATH/FILEPATH_DEVICE_PATH
+ * structures). They are used to create the firmware boot entries via the
+ * EFI runtime variable services.
+ * The structures are packed per the specification (no compiler padding).
+ */
+
+/* Attributes for the Boot#### and BootOrder variables */
+#define EFI_VARIABLE_NON_VOLATILE        0x00000001
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS  0x00000002
+#define EFI_VARIABLE_RUNTIME_ACCESS      0x00000004
+#define LOAD_OPTION_ACTIVE               0x00000001
+
+#include <pshpack1.h>
+
+typedef struct _EFI_DEVICE_PATH_NODE
+{
+    UCHAR Type;
+    UCHAR SubType;
+    UCHAR Length[2]; /* Little-endian node length, in bytes */
+} EFI_DEVICE_PATH_NODE, *PEFI_DEVICE_PATH_NODE;
+
+/* Hard-drive media device path node
+ * (MEDIA_DEVICE_PATH 0x04 / MEDIA_HARDDRIVE_DP 0x01). */
+typedef struct _EFI_HD_DEVICE_PATH
+{
+    EFI_DEVICE_PATH_NODE Header;
+    ULONG PartitionNumber;   /* 1-based partition table entry */
+    ULONGLONG PartitionStart;
+    ULONGLONG PartitionSize;
+    UCHAR Signature[16];     /* GPT partition GUID when SignatureType == 2 */
+    UCHAR MBRType;           /* 2 = GPT */
+    UCHAR SignatureType;     /* 2 = GUID signature */
+} EFI_HD_DEVICE_PATH, *PEFI_HD_DEVICE_PATH;
+
+/* File-path media device path node
+ * (MEDIA_DEVICE_PATH 0x04 / MEDIA_FILEPATH_DP 0x04). */
+typedef struct _EFI_FILE_DEVICE_PATH
+{
+    EFI_DEVICE_PATH_NODE Header;
+    WCHAR PathName[1];       /* NULL-terminated UTF-16 path */
+} EFI_FILE_DEVICE_PATH, *PEFI_FILE_DEVICE_PATH;
+
+/* EFI_LOAD_OPTION (UEFI spec, "Boot Manager"): the Description,
+ * FilePathList and OptionalData follow in the same buffer. */
+typedef struct _EFI_LOAD_OPTION
+{
+    ULONG Attributes;            /* LOAD_OPTION_ACTIVE | ... */
+    USHORT FilePathListLength;   /* Length in bytes of the FilePathList */
+    WCHAR Description[1];        /* NULL-terminated UTF-16 string */
+} EFI_LOAD_OPTION, *PEFI_LOAD_OPTION;
+
+#include <poppack.h>
+
+/* The packed sizes must match the UEFI specification */
+C_ASSERT(sizeof(EFI_DEVICE_PATH_NODE) == 4);
+C_ASSERT(sizeof(EFI_HD_DEVICE_PATH) == 42);
+C_ASSERT(sizeof(EFI_LOAD_OPTION) == 8);
+
+/* The EFI_GLOBAL_VARIABLE vendor GUID (see the UEFI specification) */
+static const GUID EfiGlobalVariableGuid =
+    {0x8BE4DF61, 0x93CA, 0x11D2, {0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C}};
+
+/* Maximum number of existing boot entries we are willing to preserve
+ * in the BootOrder variable (the variable may contain up to 65535 entries,
+ * but that many is unrealistic; bail out gracefully if it is larger). */
+#define EFI_MAX_BOOT_ORDER_ENTRIES 64
+
+/**
+ * @brief
+ * Best-effort creation of a UEFI firmware boot entry (Boot#### / BootOrder)
+ * pointing to the installed UEFI bootloader on the ESP.
+ *
+ * This requires EFI runtime variable services (NtSetSystemEnvironmentValueEx).
+ * When they are not available (e.g. legacy BIOS, or a kernel without EFI
+ * runtime support), the function fails gracefully so that the caller can
+ * fall back to the removable-media boot path (EFI\BOOT\bootx64.efi).
+ *
+ * The existing firmware boot entries and the BootOrder variable are
+ * preserved: the new entry is appended to the existing boot order, and an
+ * unused Boot#### number is chosen for it.
+ **/
+static
+NTSTATUS
+CreateEfiBootEntry(
+    _In_ PCUNICODE_STRING SystemRootPath)
+{
+    NTSTATUS Status;
+    HANDLE VolumeHandle;
+    IO_STATUS_BLOCK IoStatusBlock;
+    PARTITION_INFORMATION_EX PartitionInfo;
+    UNICODE_STRING VariableName;
+    WCHAR BootVariable[16];
+    WCHAR BootOrderVariable[] = L"BootOrder";
+    WCHAR BootDesc[] = L"ReactOS";
+    WCHAR FilePath[] = L"\\EFI\\BOOT\\bootx64.efi";
+    UCHAR Buffer[FIELD_OFFSET(EFI_LOAD_OPTION, Description) +
+                 sizeof(BootDesc) +
+                 sizeof(EFI_HD_DEVICE_PATH) +
+                 (4 + sizeof(FilePath)) +
+                 4];
+    PEFI_LOAD_OPTION LoadOption = (PEFI_LOAD_OPTION)Buffer;
+    PEFI_HD_DEVICE_PATH HdPath;
+    PEFI_FILE_DEVICE_PATH FileNode;
+    PEFI_DEVICE_PATH_NODE EndNode;
+    USHORT FileNodeLength;
+    ULONG Length, FilePathListLength;
+    USHORT BootOrder[EFI_MAX_BOOT_ORDER_ENTRIES];
+    ULONG BootOrderCount = 0;
+    ULONG BootOrderSize;
+    ULONG Index;
+
+    /* Open the volume (the ESP) so as to retrieve its partition information */
+    Status = pOpenDevice(SystemRootPath->Buffer, &VolumeHandle);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = NtDeviceIoControlFile(VolumeHandle, NULL, NULL, NULL,
+                                   &IoStatusBlock,
+                                   IOCTL_DISK_GET_PARTITION_INFO_EX,
+                                   NULL, 0,
+                                   &PartitionInfo, sizeof(PartitionInfo));
+    NtClose(VolumeHandle);
+    if (!NT_SUCCESS(Status) ||
+        PartitionInfo.PartitionStyle != PARTITION_STYLE_GPT)
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    /*
+     * Retrieve the existing BootOrder variable, preserving its contents.
+     * If it does not exist, start with an empty boot order.
+     */
+    RtlInitUnicodeString(&VariableName, BootOrderVariable);
+    BootOrderSize = sizeof(BootOrder);
+    Status = NtQuerySystemEnvironmentValueEx(&VariableName,
+                                             (LPGUID)&EfiGlobalVariableGuid,
+                                             BootOrder,
+                                             &BootOrderSize,
+                                             NULL);
+    if (Status == STATUS_VARIABLE_NOT_FOUND)
+    {
+        /* No boot order yet */
+        BootOrderCount = 0;
+    }
+    else if (!NT_SUCCESS(Status))
+    {
+        /* The variable services are unavailable: bail out, the caller
+         * falls back to the removable-media boot path. */
+        DPRINT1("NtQuerySystemEnvironmentValueEx(BootOrder) failed (Status 0x%08lx);\n"
+                "skipping the creation of a UEFI boot entry.\n", Status);
+        return Status;
+    }
+    else if (BootOrderSize % sizeof(USHORT) != 0)
+    {
+        /* Corrupted variable */
+        return STATUS_UNSUCCESSFUL;
+    }
+    else
+    {
+        BootOrderCount = BootOrderSize / sizeof(USHORT);
+        if (BootOrderCount > EFI_MAX_BOOT_ORDER_ENTRIES)
+        {
+            DPRINT1("The UEFI BootOrder variable has %lu entries, more than the\n"
+                    "supported maximum of %lu; skipping the creation of a UEFI boot entry.\n",
+                    BootOrderCount, (ULONG)EFI_MAX_BOOT_ORDER_ENTRIES);
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    /*
+     * Find an unused Boot#### number (the first one whose variable does
+     * not exist yet).
+     */
+    for (Index = 0; Index < 0x100; ++Index)
+    {
+        ULONG Size = 0;
+
+        RtlStringCchPrintfW(BootVariable, _countof(BootVariable),
+                            L"Boot%04x", Index);
+        RtlInitUnicodeString(&VariableName, BootVariable);
+
+        Status = NtQuerySystemEnvironmentValueEx(&VariableName,
+                                                 (LPGUID)&EfiGlobalVariableGuid,
+                                                 NULL,
+                                                 &Size,
+                                                 NULL);
+        if (Status == STATUS_VARIABLE_NOT_FOUND)
+            break; /* This number is free */
+        if (!NT_SUCCESS(Status))
+        {
+            /* Variable services unavailable: bail out */
+            DPRINT1("NtQuerySystemEnvironmentValueEx(%S) failed (Status 0x%08lx);\n"
+                    "skipping the creation of a UEFI boot entry.\n",
+                    BootVariable, Status);
+            return Status;
+        }
+    }
+    if (Index >= 0x100)
+    {
+        /* No free boot entry number found */
+        DPRINT1("No free UEFI Boot#### number found; skipping the creation\n"
+                "of a UEFI boot entry.\n");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    RtlZeroMemory(Buffer, sizeof(Buffer));
+
+    /* Build the EFI_LOAD_OPTION structure:
+     * Attributes + FilePathListLength + Description + FilePathList. */
+    LoadOption->Attributes = LOAD_OPTION_ACTIVE;
+    LoadOption->FilePathListLength = sizeof(EFI_HD_DEVICE_PATH) +
+                                     (4 + sizeof(FilePath)) + 4;
+
+    /* Description */
+    RtlCopyMemory(LoadOption->Description, BootDesc, sizeof(BootDesc));
+
+    /* HD device path node: the ESP partition (GPT GUID signature) */
+    HdPath = (PEFI_HD_DEVICE_PATH)((PUCHAR)LoadOption->Description + sizeof(BootDesc));
+    HdPath->Header.Type = 0x04;  /* MEDIA_DEVICE_PATH */
+    HdPath->Header.SubType = 0x01; /* HD */
+    HdPath->Header.Length[0] = sizeof(EFI_HD_DEVICE_PATH); /* 42 */
+    HdPath->Header.Length[1] = 0;
+    HdPath->PartitionNumber = PartitionInfo.PartitionNumber;
+    HdPath->PartitionStart = PartitionInfo.StartingOffset.QuadPart / 512ULL;
+    HdPath->PartitionSize = PartitionInfo.PartitionLength.QuadPart / 512ULL;
+    HdPath->MBRType = 2; /* GPT */
+    HdPath->SignatureType = 2; /* GUID signature */
+    RtlCopyMemory(HdPath->Signature, &PartitionInfo.Gpt.PartitionId, sizeof(GUID));
+
+    /* File path device path node: \EFI\BOOT\bootx64.efi */
+    FileNode = (PEFI_FILE_DEVICE_PATH)((PUCHAR)HdPath + sizeof(EFI_HD_DEVICE_PATH));
+    FileNodeLength = (USHORT)(4 + sizeof(FilePath));
+    FileNode->Header.Type = 0x04;  /* MEDIA_DEVICE_PATH */
+    FileNode->Header.SubType = 0x04; /* File Path */
+    FileNode->Header.Length[0] = (UCHAR)(FileNodeLength & 0xFF);
+    FileNode->Header.Length[1] = (UCHAR)(FileNodeLength >> 8);
+    RtlCopyMemory(FileNode->PathName, FilePath, sizeof(FilePath));
+
+    /* End-Entire device path node */
+    EndNode = (PEFI_DEVICE_PATH_NODE)((PUCHAR)FileNode + FileNodeLength);
+    EndNode->Type = 0x7F;  /* END_DEVICE_PATH_TYPE */
+    EndNode->SubType = 0xFF; /* END_ENTIRE_DEVICE_PATH_SUBTYPE */
+    EndNode->Length[0] = 4;
+    EndNode->Length[1] = 0;
+
+    FilePathListLength = LoadOption->FilePathListLength;
+    Length = FIELD_OFFSET(EFI_LOAD_OPTION, Description) +
+             sizeof(BootDesc) + FilePathListLength;
+
+    /* Write the new Boot#### variable */
+    RtlInitUnicodeString(&VariableName, BootVariable);
+    Status = NtSetSystemEnvironmentValueEx(&VariableName,
+                                           (LPGUID)&EfiGlobalVariableGuid,
+                                           Buffer,
+                                           Length,
+                                           EFI_VARIABLE_NON_VOLATILE |
+                                           EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                                           EFI_VARIABLE_RUNTIME_ACCESS);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("Failed to create the UEFI boot entry '%S' (Status 0x%08lx);\n"
+                "falling back to the removable-media boot path.\n",
+                BootVariable, Status);
+        return Status;
+    }
+
+    /* Update the BootOrder variable, appending the new boot entry
+     * and preserving all the existing entries. */
+    BootOrder[BootOrderCount] = (USHORT)Index;
+    RtlInitUnicodeString(&VariableName, BootOrderVariable);
+    Status = NtSetSystemEnvironmentValueEx(&VariableName,
+                                           (LPGUID)&EfiGlobalVariableGuid,
+                                           BootOrder,
+                                           (BootOrderCount + 1) * sizeof(USHORT),
+                                           EFI_VARIABLE_NON_VOLATILE |
+                                           EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                                           EFI_VARIABLE_RUNTIME_ACCESS);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("Failed to update the UEFI BootOrder variable (Status 0x%08lx)\n",
+                Status);
+        return Status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief
+ * Installs the UEFI FreeLoader executable into the EFI System Partition
+ * (ESP) of the system, and optionally creates a firmware boot entry for it.
+ *
+ * The UEFI bootloader is copied to "EFI\BOOT\bootx64.efi" (the default,
+ * removable-media boot path that requires no firmware boot entry), and a
+ * 'freeldr.ini' configuration file pointing to the ReactOS installation
+ * partition is written at the root of the ESP. A firmware boot entry is
+ * then best-effort created (see CreateEfiBootEntry()); if it fails, the
+ * removable-media path above still allows the machine to boot.
+ **/
+static
+NTSTATUS
+InstallEfiBootloaderFiles(
+    _In_ PCUNICODE_STRING SystemRootPath,
+    _In_ PCUNICODE_STRING SourceRootPath,
+    _In_ PCUNICODE_STRING DestinationArcPath)
+{
+    NTSTATUS Status;
+    WCHAR SrcPath[MAX_PATH];
+    WCHAR DstPath[MAX_PATH];
+    WCHAR DirPath[MAX_PATH];
+
+    DPRINT1("InstallEfiBootloaderFiles: ESP path '%wZ'\n", SystemRootPath);
+
+    /* Create the EFI\BOOT directory on the ESP */
+    CombinePaths(DirPath, ARRAYSIZE(DirPath), 2, SystemRootPath->Buffer, L"EFI");
+    DPRINT1("Creating '%S' on the ESP\n", DirPath);
+    Status = SetupCreateDirectory(DirPath);
+    if (!NT_SUCCESS(Status) && (Status != STATUS_OBJECT_NAME_COLLISION))
+    {
+        DPRINT1("SetupCreateDirectory() failed (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+
+    CombinePaths(DirPath, ARRAYSIZE(DirPath), 2, SystemRootPath->Buffer, L"EFI\\BOOT");
+    DPRINT1("Creating '%S' on the ESP\n", DirPath);
+    Status = SetupCreateDirectory(DirPath);
+    if (!NT_SUCCESS(Status) && (Status != STATUS_OBJECT_NAME_COLLISION))
+    {
+        DPRINT1("SetupCreateDirectory() failed (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+
+    /* Copy the UEFI FreeLoader to the ESP, always overwriting the older version.
+     * The file name follows the UEFI removable-media convention, per
+     * architecture (bootx64.efi on x86-64, bootia32.efi on x86, ...). */
+    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\uefildr.efi");
+    CombinePaths(DstPath, ARRAYSIZE(DstPath), 2, SystemRootPath->Buffer,
+#if defined(_M_AMD64)
+                 L"EFI\\BOOT\\bootx64.efi");
+#elif defined(_M_IX86)
+                 L"EFI\\BOOT\\bootia32.efi");
+#else
+                 L"EFI\\BOOT\\bootx64.efi");
+#endif
+
+    DPRINT1("Copying UEFI bootloader: %S ==> %S\n", SrcPath, DstPath);
+    Status = SetupCopyFile(SrcPath, DstPath, FALSE);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("SetupCopyFile() failed (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+
+    /* Create new 'freeldr.ini' on the ESP, pointing to the ReactOS partition */
+    DPRINT1("Creating 'freeldr.ini' on the ESP (ARC path '%wZ')\n", DestinationArcPath);
+    Status = CreateFreeLoaderIniForReactOS(SystemRootPath->Buffer, DestinationArcPath->Buffer);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("CreateFreeLoaderIniForReactOS() failed (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+
+    /* Best-effort creation of a firmware boot entry. When EFI runtime
+     * variable services are unavailable (e.g. on this ReactOS tree the
+     * NtSetSystemEnvironmentValueEx syscall is not implemented yet), the
+     * machine still boots via the removable-media path (EFI\BOOT\bootx64.efi). */
+    Status = CreateEfiBootEntry(SystemRootPath);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("No UEFI boot entry created (Status 0x%08lx);\n"
+                "the machine will boot via the removable-media path.\n", Status);
+    }
+
+    return STATUS_SUCCESS;
+}
+
 static
 NTSTATUS
 InstallFatBootcodeToPartition(
@@ -1496,10 +1876,26 @@ InstallBootManagerAndBootEntriesWorker(
     BOOLEAN IsBIOS = ((ArchType == ARCH_PcAT) || (ArchType == ARCH_NEC98x86));
     UCHAR InstallType = (Options & 0x03);
 
-    // FIXME: We currently only support BIOS-based PCs
-    // TODO: Support other platforms
     if (!IsBIOS)
+    {
+        /* (U)EFI-based machine: install the UEFI bootloader into the
+         * EFI System Partition (ESP). */
+        if (ArchType == ARCH_Efi)
+        {
+            Status = InstallEfiBootloaderFiles(SystemRootPath,
+                                               SourceRootPath,
+                                               DestinationArcPath);
+            if (!NT_SUCCESS(Status))
+            {
+                DPRINT1("InstallEfiBootloaderFiles() failed (Status 0x%08lx)\n", Status);
+            }
+            return Status;
+        }
+
+        // FIXME: We currently only support BIOS-based PCs
+        // TODO: Support other platforms
         return STATUS_NOT_SUPPORTED;
+    }
 
     if (InstallType <= 1)
     {
@@ -1786,33 +2182,40 @@ InstallBootManagerAndBootEntries(
             goto Quit;
         }
 
-        /*
-         * Retrieve the volume's partition information.
-         * NOTE: Fails for floppy disks.
-         *
-         * NOTE: We can use the non-EX IOCTL because the super-floppy test will
-         * fail anyway if the disk is NOT MBR-partitioned. (If the disk is GPT,
-         * the IOCTL would return only the MBR protective partition, but the
-         * super-floppy test would fail due to the wrong partitioning style.)
-         */
-        Status = NtDeviceIoControlFile(DeviceHandle,
-                                       NULL, NULL, NULL,
-                                       &IoStatusBlock,
-                                       IOCTL_DISK_GET_PARTITION_INFO,
-                                       NULL, 0,
-                                       &PartitionInfo,
-                                       sizeof(PartitionInfo));
-        if (!NT_SUCCESS(Status))
-        {
-            DPRINT1("IOCTL_DISK_GET_PARTITION_INFO failed (Status 0x%08lx)\n", Status);
-            goto Quit;
-        }
-
         DiskNumber = DeviceNumber.DeviceNumber;
         PartitionStyle = DiskGeoEx.Partition.PartitionStyle;
-        IsSuperFloppy = IsDiskSuperFloppy2(&DiskGeoEx.Partition,
-                                           (PULONGLONG)&DiskGeoEx.DiskSize.QuadPart,
-                                           &PartitionInfo);
+
+        /*
+         * Retrieve the volume's partition information, for the super-floppy
+         * test below. NOTE: Fails for floppy disks.
+         *
+         * IOCTL_DISK_GET_PARTITION_INFO is MBR-only: PARTMGR rejects it with
+         * STATUS_INVALID_DEVICE_REQUEST on any other partitioning style (see
+         * partmgr!PartitionHandleDeviceControl). Only issue it for MBR disks.
+         * A GPT disk cannot be a super-floppy by definition, so skip the test
+         * there instead of treating the expected rejection as fatal -- doing so
+         * aborted the whole bootloader installation on every GPT/UEFI install.
+         */
+        IsSuperFloppy = FALSE;
+        if (PartitionStyle == PARTITION_STYLE_MBR)
+        {
+            Status = NtDeviceIoControlFile(DeviceHandle,
+                                           NULL, NULL, NULL,
+                                           &IoStatusBlock,
+                                           IOCTL_DISK_GET_PARTITION_INFO,
+                                           NULL, 0,
+                                           &PartitionInfo,
+                                           sizeof(PartitionInfo));
+            if (!NT_SUCCESS(Status))
+            {
+                DPRINT1("IOCTL_DISK_GET_PARTITION_INFO failed (Status 0x%08lx)\n", Status);
+                goto Quit;
+            }
+
+            IsSuperFloppy = IsDiskSuperFloppy2(&DiskGeoEx.Partition,
+                                               (PULONGLONG)&DiskGeoEx.DiskSize.QuadPart,
+                                               &PartitionInfo);
+        }
     }
 
     Status = InstallBootManagerAndBootEntriesWorker(

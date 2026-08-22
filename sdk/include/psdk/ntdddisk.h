@@ -242,6 +242,14 @@ extern "C" {
 #define IOCTL_DISK_UPDATE_PROPERTIES \
   CTL_CODE(IOCTL_DISK_BASE, 0x0050, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/*
+ * PartMgr private: force a synchronous PnP bus-relation re-enumeration so
+ * that newly-created partition PDOs are started (and their symlinks and
+ * device interfaces published) before the caller proceeds.
+ */
+#define IOCTL_DISK_UPDATE_PARTITION_DEVICE_RELATIONS \
+  CTL_CODE(IOCTL_DISK_BASE, 0x0051, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 #define IOCTL_DISK_VERIFY \
   CTL_CODE(IOCTL_DISK_BASE, 0x0005, METHOD_BUFFERED, FILE_ANY_ACCESS)
 

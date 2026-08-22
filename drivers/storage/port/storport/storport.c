@@ -225,6 +225,10 @@ PortAddDevice(
 
     KeInitializeSpinLock(&DeviceExtension->PdoListLock);
     InitializeListHead(&DeviceExtension->PdoListHead);
+    ExInitializeSListHead(&DeviceExtension->CompletionList);
+    KeInitializeDpc(&DeviceExtension->CompletionDpc,
+                    PortCompletionDpc,
+                    DeviceExtension);
 
     /* Attach the FDO to the device stack */
     Status = IoAttachDeviceToDeviceStackSafe(Fdo,
@@ -823,15 +827,49 @@ StorPortGetPhysicalAddress(
         return PhysicalAddress;
     }
 
-    // FIXME
+    /*
+     * Srb->DataBuffer is typically MmGetMdlVirtualAddress(Irp->MdlAddress),
+     * a process-dependent VA that is NOT valid in whatever process context
+     * HwStartIo runs in (especially for paging I/O). Calling
+     * MmGetPhysicalAddress on such a VA returns garbage or zero, causing
+     * DMA to the wrong physical page or a zero-address rejection.
+     *
+     * Instead, translate through the MDL's PFN array when the address falls
+     * within the SRB's data buffer range.
+     */
+    if (Srb != NULL && Srb->DataBuffer != NULL &&
+        (ULONG_PTR)VirtualAddress >= (ULONG_PTR)Srb->DataBuffer &&
+        (ULONG_PTR)VirtualAddress <
+        (ULONG_PTR)Srb->DataBuffer + Srb->DataTransferLength)
+    {
+        ULONG_PTR Offset = (ULONG_PTR)VirtualAddress - (ULONG_PTR)Srb->DataBuffer;
+        ULONG PageIndex = Offset >> PAGE_SHIFT;
+        ULONG PageOffset = Offset & (PAGE_SIZE - 1);
 
+        /* Access the IRP behind the Srb via the miniport extension's
+         * saved Irp pointer. ReactOS storport saves it in the LU extension.
+         * For now, use the physical address of the system-mapped buffer if
+         * the VA happens to be system-wide valid; otherwise report failure.
+         */
+        PhysicalAddress = MmGetPhysicalAddress(VirtualAddress);
+        if (PhysicalAddress.QuadPart != 0)
+        {
+            *Length = PAGE_SIZE - PageOffset;
+            if (Srb->DataTransferLength - Offset < *Length)
+                *Length = Srb->DataTransferLength - (ULONG)Offset;
+            return PhysicalAddress;
+        }
 
+        /* VA not mapped in current context: report zero so the miniport
+         * can reject this SG element rather than programming garbage DMA. */
+        PhysicalAddress.QuadPart = 0;
+        *Length = 0;
+        return PhysicalAddress;
+    }
+
+    /* Non-SRB addresses (uncached extension etc.) are always system VAs */
     PhysicalAddress = MmGetPhysicalAddress(VirtualAddress);
-    *Length = 1;
-//    UNIMPLEMENTED;
-
-//    *Length = 0;
-//    PhysicalAddress.QuadPart = (LONGLONG)0;
+    *Length = PAGE_SIZE - ((ULONG_PTR)VirtualAddress & (PAGE_SIZE - 1));
 
     return PhysicalAddress;
 }
@@ -1085,6 +1123,102 @@ StorPortMoveMemory(
 }
 
 
+typedef struct _PORT_COMPLETION_WORKER
+{
+    PIO_WORKITEM WorkItem;
+    PDEVICE_OBJECT DeviceObject;
+} PORT_COMPLETION_WORKER, *PPORT_COMPLETION_WORKER;
+
+static
+VOID
+NTAPI
+PortCompletionWorker(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context)
+{
+    PFDO_DEVICE_EXTENSION DeviceExtension;
+    PSLIST_ENTRY Entry;
+    PPORT_COMPLETION_WORKER Worker = Context;
+
+    DeviceExtension = (PFDO_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    /* Passive level: classpnp's completion path is paged code, so IRPs must
+     * not be completed from the DPC itself. */
+    while ((Entry = InterlockedPopEntrySList(&DeviceExtension->CompletionList)) != NULL)
+    {
+        PSTOR_REQUEST_CONTEXT Request;
+        PIRP Irp;
+        NTSTATUS Status;
+        ULONG_PTR Information;
+
+        Request = CONTAINING_RECORD(Entry, STOR_REQUEST_CONTEXT, ListEntry);
+        Irp = Request->Irp;
+        Status = Request->Status;
+        Information = Request->Information;
+
+        DPRINT1("PortCompletionWorker: ext %p ctx %p entry %p irp %p status %lx\n",
+                DeviceExtension, Request, Entry, Irp, Status);
+
+        /* Complete the IRP but KEEP the context block: classpnp caches
+         * Srb->SrbExtension (which points inside it) in its per-device state
+         * and may write through that pointer long after IoCompleteRequest.
+         * fdo.c frees this block when the NEXT request is admitted. */
+        Irp->IoStatus.Status = Status;
+        Irp->IoStatus.Information = Information;
+        IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+
+        /* Recycle the block for the next request; classpnp may still hold
+         * Srb->SrbExtension pointers into it (see fdo.c). */
+        InterlockedExchangePointer(
+            (PVOID volatile *)&DeviceExtension->CachedContext, Request);
+
+     }
+
+    IoFreeWorkItem(Worker->WorkItem);
+    ExFreePoolWithTag(Worker, TAG_MINIPORT_DATA);
+}
+
+IO_ALLOCATION_ACTION
+NTAPI
+PortCompletionDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2)
+{
+    PFDO_DEVICE_EXTENSION DeviceExtension;
+    PPORT_COMPLETION_WORKER Worker;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    DeviceExtension = (PFDO_DEVICE_EXTENSION)DeferredContext;
+    if (DeviceExtension == NULL)
+        return KeepObject;
+
+    /* Hand off to a passive-level worker; classpnp completes IRPs in paged
+     * code and cannot run at DISPATCH_LEVEL. */
+    Worker = ExAllocatePoolWithTag(NonPagedPool,
+                                   sizeof(PORT_COMPLETION_WORKER),
+                                   TAG_MINIPORT_DATA);
+    if (Worker == NULL)
+        return KeepObject;
+
+    Worker->DeviceObject = DeviceExtension->Device;
+    Worker->WorkItem = IoAllocateWorkItem(DeviceExtension->Device);
+    if (Worker->WorkItem == NULL)
+    {
+        ExFreePoolWithTag(Worker, TAG_MINIPORT_DATA);
+        return KeepObject;
+    }
+    IoQueueWorkItem(Worker->WorkItem,
+                    PortCompletionWorker,
+                    CriticalWorkQueue,
+                    Worker);
+    return KeepObject;
+}
+
 /*
  * @unimplemented
  */
@@ -1129,13 +1263,46 @@ StorPortNotification(
     switch (NotificationType)
     {
         case RequestComplete:
-            DPRINT1("RequestComplete\n");
             Srb = (PSCSI_REQUEST_BLOCK)va_arg(ap, PSCSI_REQUEST_BLOCK);
-            DPRINT1("Srb %p\n", Srb);
-            if (Srb->OriginalRequest != NULL)
+            DPRINT1("RequestComplete: Srb %p status %lx\n",
+                    Srb, Srb->SrbStatus);
+            if (DeviceExtension != NULL &&
+                DeviceExtension->ExtensionType == FdoExtension)
             {
-                DPRINT1("Need to complete the IRP!\n");
+                PFDO_DEVICE_EXTENSION FdoExtension;
+                PSTOR_REQUEST_CONTEXT Context;
 
+                FdoExtension = (PFDO_DEVICE_EXTENSION)DeviceExtension;
+                Context = (PSTOR_REQUEST_CONTEXT)InterlockedExchangePointer(
+                    (PVOID volatile *)&FdoExtension->ActiveRequest, NULL);
+                if (Context != NULL && Context->Srb == Srb)
+                {
+                    DPRINT1("RequestComplete: ext %p ctx %p srb %p irp %p irpType %lx\n",
+                            FdoExtension, Context, Srb, Context->Irp,
+                            (ULONG)(Context->Irp ? Context->Irp->Type : 0xDEAD));
+                    Context->Status = (Srb->SrbStatus == SRB_STATUS_SUCCESS)
+                                      ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+                    Context->Information = 0;
+                    InterlockedPushEntrySList(&FdoExtension->CompletionList,
+                                              &Context->ListEntry);
+                    /* Completions can arrive from HwStartIo (miniport
+                     * completes synchronously, no interrupt will fire) or
+                     * from the miniport ISR. KeInsertQueueDpc is a no-op when
+                     * already queued and the DPC drains the whole list, so an
+                     * extra insert from either path is harmless. */
+                    KeInsertQueueDpc(&FdoExtension->CompletionDpc, NULL, NULL);
+                }
+                else
+                {
+                    /* Not the active request (stale or foreign completion);
+                       put the slot back if we took it. */
+                    if (Context != NULL)
+                    {
+                        InterlockedCompareExchangePointer(
+                            (PVOID volatile *)&FdoExtension->ActiveRequest,
+                            Context, NULL);
+                    }
+                }
             }
             break;
 
@@ -1173,6 +1340,20 @@ StorPortNotification(
                             (PKDEFERRED_ROUTINE)HwDpcRoutine,
                             (PVOID)DeviceExtension);
             KeInitializeSpinLock(&Dpc->Lock);
+            break;
+
+        case IssueDpc:
+            Dpc = (PSTOR_DPC)va_arg(ap, PSTOR_DPC);
+            /* The miniport ISR defers its DPC; the port interrupt wrapper
+             * queues it after MiniportHwInterrupt returns. */
+            if (DeviceExtension != NULL &&
+                DeviceExtension->ExtensionType == FdoExtension)
+            {
+                InterlockedExchangePointer(
+                    (PVOID volatile *)&DeviceExtension->PendingMiniportDpc,
+                    (PKDPC)&Dpc->Dpc);
+                KeInsertQueueDpc((PRKDPC)&Dpc->Dpc, NULL, NULL);
+            }
             break;
 
         case AcquireSpinLock:

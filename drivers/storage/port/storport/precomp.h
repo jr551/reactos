@@ -86,6 +86,14 @@ typedef struct _UNIT_DATA
     LIST_ENTRY ListEntry;
     INQUIRYDATA InquiryData;
 } UNIT_DATA, *PUNIT_DATA;
+typedef struct _STOR_REQUEST_CONTEXT
+{
+    SLIST_ENTRY ListEntry;      /* completion queue link (must be first) */
+    PSCSI_REQUEST_BLOCK Srb;
+    PIRP Irp;
+    NTSTATUS Status;
+    ULONG_PTR Information;
+} STOR_REQUEST_CONTEXT, *PSTOR_REQUEST_CONTEXT;
 
 typedef struct _FDO_DEVICE_EXTENSION
 {
@@ -111,6 +119,30 @@ typedef struct _FDO_DEVICE_EXTENSION
     PHW_PASSIVE_INITIALIZE_ROUTINE HwPassiveInitRoutine;
     PKINTERRUPT Interrupt;
     ULONG InterruptIrql;
+    KSPIN_LOCK DpcLock;
+    KSPIN_LOCK StartIoLock;
+    KSPIN_LOCK RequestLock;
+    ULONG RequestsBusy;
+    ULONG RequestsToComplete;
+    PSTOR_REQUEST_CONTEXT ActiveRequest;
+    PSTOR_REQUEST_CONTEXT LastCompletedContext;
+    /* Single cached request context, recycled across requests: classpnp may
+       keep Srb->SrbExtension pointers alive long after completion, so the
+       block is only ever freed at device removal. */
+    PSTOR_REQUEST_CONTEXT CachedContext;
+    /*
+     * Queue of completions claimed by StorPortNotification(RequestComplete)
+     * but not yet completed: the completion DPC drains the whole queue at
+     * DISPATCH_LEVEL. A queue (not a single slot) is required because the
+     * class driver may have a second request in flight while the first
+     * completion is still queued; a single slot would drop that completion
+     * (CAS failure) and strand its IRP forever.
+     */
+    SLIST_HEADER CompletionList;
+    KDPC CompletionDpc;
+    /* Miniport DPC deferred by StorPortNotification(IssueDpc) from the
+       miniport ISR at DIRQL; queued by the port interrupt wrapper. */
+    PKDPC PendingMiniportDpc;
 
     KSPIN_LOCK PdoListLock;
     LIST_ENTRY PdoListHead;
@@ -134,6 +166,10 @@ typedef struct _PDO_DEVICE_EXTENSION
 
 
 } PDO_DEVICE_EXTENSION, *PPDO_DEVICE_EXTENSION;
+NTSTATUS
+PortPdoDeviceControl(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp);
 
 
 /* fdo.c */
@@ -143,6 +179,14 @@ NTAPI
 PortFdoScsi(
     _In_ PDEVICE_OBJECT DeviceObject,
     _In_ PIRP Irp);
+
+IO_ALLOCATION_ACTION
+NTAPI
+PortCompletionDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2);
 
 NTSTATUS
 NTAPI

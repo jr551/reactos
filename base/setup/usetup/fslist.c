@@ -64,7 +64,8 @@ AddProvider(
 static VOID
 InitializeFileSystemList(
     IN OUT PFILE_SYSTEM_LIST List,
-    IN BOOLEAN ForceFormat)
+    IN BOOLEAN ForceFormat,
+    IN BOOLEAN FatOnly)
 {
     PCWSTR FileSystemName;
     ULONG Index;
@@ -95,6 +96,15 @@ InitializeFileSystemList(
         if (FatPresent && _wcsicmp(FileSystemName, L"FAT32") == 0)
             continue;
 #endif
+        /* EFI System Partitions must be formatted with a FAT file system
+         * (the firmware only understands FAT on the ESP); only offer
+         * FAT/FAT32 for them. */
+        if (FatOnly &&
+            _wcsicmp(FileSystemName, L"FAT") != 0 &&
+            _wcsicmp(FileSystemName, L"FAT32") != 0)
+        {
+            continue;
+        }
         AddProvider(List, FileSystemName);
     }
 
@@ -110,7 +120,8 @@ CreateFileSystemList(
     IN SHORT Left,
     IN SHORT Top,
     IN BOOLEAN ForceFormat,
-    IN PCWSTR SelectFileSystem)
+    IN PCWSTR SelectFileSystem,
+    IN BOOLEAN FatOnly)
 {
     PFILE_SYSTEM_LIST List;
     PFILE_SYSTEM_ITEM Item;
@@ -125,7 +136,7 @@ CreateFileSystemList(
     List->Selected = NULL;
     InitializeListHead(&List->ListHead);
 
-    InitializeFileSystemList(List, ForceFormat);
+    InitializeFileSystemList(List, ForceFormat, FatOnly);
 
     /* Search for SelectFileSystem in list */
     ListEntry = List->ListHead.Flink;

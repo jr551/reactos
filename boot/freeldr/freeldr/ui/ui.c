@@ -19,6 +19,11 @@
 
 #include <freeldr.h>
 
+#ifdef UEFIBOOT
+#include <Uefi.h> // For EFI_SYSTEM_TABLE (used by UiIsBootViaUefi)
+extern EFI_SYSTEM_TABLE *GlobalSystemTable;
+#endif
+
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(UI);
 
@@ -88,6 +93,24 @@ UIVTBL UiVtbl =
     NoUiDisplayMenu,
     NoUiDrawMenu,
 };
+
+/**
+ * @brief
+ * Determines at runtime whether the machine was booted via (U)EFI.
+ *
+ * In the UEFI build of FreeLoader, the EFI system table pointer is set at
+ * entry time (see arch/uefi/uefildr.c:EfiEntry()); in the BIOS build this
+ * always returns FALSE.
+ **/
+BOOLEAN
+UiIsBootViaUefi(VOID)
+{
+#ifdef UEFIBOOT
+    return (GlobalSystemTable != NULL);
+#else
+    return FALSE;
+#endif
+}
 
 BOOLEAN UiInitialize(BOOLEAN ShowUi)
 {

@@ -196,8 +196,19 @@ static NTSTATUS vio_legacy_setup_vq(struct virtqueue **queue,
     }
 
     /* activate the queue */
-    iowrite32(vdev, (u32)(mem_get_physical_address(vdev, info->queue) >> VIRTIO_PCI_QUEUE_ADDR_SHIFT),
-        vdev->addr + VIRTIO_PCI_QUEUE_PFN);
+    {
+        ULONGLONG queue_phys = mem_get_physical_address(vdev, info->queue);
+
+        /* The legacy QUEUE_PFN register holds a 32-bit page frame number,
+         * so the queue must be page aligned and within the 32-bit range. */
+        if ((queue_phys & (PAGE_SIZE - 1)) != 0 ||
+            (queue_phys >> VIRTIO_PCI_QUEUE_ADDR_SHIFT) > 0xffffffff) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto err_activate_queue;
+        }
+        iowrite32(vdev, (u32)(queue_phys >> VIRTIO_PCI_QUEUE_ADDR_SHIFT),
+            vdev->addr + VIRTIO_PCI_QUEUE_PFN);
+    }
 
     /* create the vring */
     vq = vring_new_virtqueue_split(index, info->num,

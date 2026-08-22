@@ -3542,6 +3542,9 @@ Return Value:
              *  It will be used to count down the pieces as they complete.
              */
             Irp->Tail.Overlay.DriverContext[0] = LongToPtr(numPackets);
+            DbgPrint("XFERDBG: set origIrp=%p counter=%d (multi path, "
+                     "xferLen=%u hwMax=%u)\n",
+                     Irp, numPackets, entireXferLen, hwMaxXferLen);
 
             /*
              *  For the common 1-packet case, we want to allow for an optimization by BlkCache
@@ -3663,6 +3666,8 @@ Return Value:
              */
             Irp->IoStatus.Information = 0;
             Irp->Tail.Overlay.DriverContext[0] = LongToPtr(1);
+            DbgPrint("XFERDBG: set origIrp=%p counter=1 (lowmem/startio path)\n",
+                     Irp);
             IoMarkIrpPending(Irp);
 
             /*

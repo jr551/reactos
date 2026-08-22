@@ -26,6 +26,8 @@
 
 #include "usetup.h"
 
+#include <diskguid.h> // For the GPT partition type GUIDs (PARTITION_SYSTEM_GUID, ...)
+
 #define NDEBUG
 #include <debug.h>
 
@@ -37,7 +39,31 @@ GetPartitionTypeString(
     OUT PSTR strBuffer,
     IN ULONG cchBuffer)
 {
-    if (PartEntry->PartitionType == PARTITION_ENTRY_UNUSED)
+    if (PartEntry->DiskEntry->DiskStyle == PARTITION_STYLE_GPT)
+    {
+        PCSTR Description;
+
+        if (IsEqualGUID(&PartEntry->PartitionGuid, &PARTITION_ENTRY_UNUSED_GUID))
+        {
+            RtlStringCchCopyA(strBuffer, cchBuffer,
+                              MUIGetString(STRING_FORMATUNUSED));
+        }
+        else
+        {
+            /* Do the table lookup on the GPT partition type GUID */
+            Description = LookupPartitionTypeString(PARTITION_STYLE_GPT,
+                                                    &PartEntry->PartitionGuid);
+            if (Description)
+            {
+                RtlStringCchCopyA(strBuffer, cchBuffer, Description);
+                return;
+            }
+
+            /* We are here because the partition type is unknown */
+            if (cchBuffer > 0) *strBuffer = '\0';
+        }
+    }
+    else if (PartEntry->PartitionType == PARTITION_ENTRY_UNUSED)
     {
         RtlStringCchCopyA(strBuffer, cchBuffer,
                           MUIGetString(STRING_FORMATUNUSED));

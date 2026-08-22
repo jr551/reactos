@@ -199,6 +199,9 @@ UiShowMessageBoxesInArgv(
 
 BOOLEAN    UiEditBox(PCSTR MessageText, PCHAR EditTextBuffer, ULONG Length);
 
+/* Returns TRUE when FreeLoader has been booted via (U)EFI */
+BOOLEAN    UiIsBootViaUefi(VOID);
+
 UCHAR    UiTextToColor(PCSTR ColorText);                        // Converts the text color into it's equivalent color value
 UCHAR    UiTextToFillStyle(PCSTR FillStyleText);                // Converts the text fill into it's equivalent fill value
 

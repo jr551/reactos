@@ -59,6 +59,8 @@
 #endif
 #endif // __REACTOS__
 
+#define NDEBUG
+#include <debug.h>
 #ifdef __REACTOS__
 #define malloc(size)    RtlAllocateHeap(RtlGetProcessHeap(), 0, (size))
 #define free(ptr)       RtlFreeHeap(RtlGetProcessHeap(), 0, (ptr))
@@ -1385,8 +1387,27 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
 
     InitializeObjectAttributes(&attr, DriveRoot, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    Status = NtOpenFile(&h, FILE_GENERIC_READ | FILE_GENERIC_WRITE, &attr, &iosb,
-                        FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT);
+    /* Retry the write-capable open on transient statuses (fresh partition
+     * PDO may still be starting). Fail fast on anything else. */
+    {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -10000000LL; /* 1s */
+        for (ULONG Retry = 0; Retry < 30; Retry++)
+        {
+            Status = NtOpenFile(&h, FILE_GENERIC_READ | FILE_GENERIC_WRITE, &attr, &iosb,
+                                FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT);
+            if (NT_SUCCESS(Status))
+                break;
+            DPRINT("BtrfsFormat: NtOpenFile retry %lu failed 0x%08x\n", Retry + 1, Status);
+            if (Status != STATUS_NO_SUCH_DEVICE &&
+                Status != STATUS_OBJECT_NAME_NOT_FOUND &&
+                Status != STATUS_DEVICE_NOT_READY)
+            {
+                break;
+            }
+            NtDelayExecution(FALSE, &Delay);
+        }
+    }
 
     if (!NT_SUCCESS(Status))
         return Status;

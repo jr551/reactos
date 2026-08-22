@@ -33,6 +33,8 @@
 @ stdcall GetNextPartition(ptr ptr)
 @ stdcall GetPrevPartition(ptr ptr)
 @ stdcall GetAdjUnpartitionedEntry(ptr long)
+@ stdcall InitializeDiskGpt(ptr ptr)
+@ stdcall IsEfiSystemPartition(ptr)
 @ stdcall PartitionCreateChecks(ptr int64 ptr)
 @ cdecl -ret64 RoundingDivide(int64 int64)
 ;;;;

@@ -1,0 +1,65 @@
+; virtio_gpu.inf
+;
+; Installation file for the VirtIO GPU display adapter
+;
+[Version]
+Signature  = "$Windows NT$"
+LayoutFile = layout.inf
+Class      = Display
+ClassGUID  = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider   = %ReactOS%
+DriverVer  = 08/11/2026,1.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+VirtioGpu.Display_CopyFiles = 11
+
+[Manufacturer]
+%VirtioGpu% = VirtioGpu
+
+[VirtioGpu]
+; Modern (virtio 1.0) QEMU virtio-gpu
+%VirtioGpu.DeviceDesc% = VirtioGpu, PCI\VEN_1AF4&DEV_1050
+; Legacy/transitional device id, kept for non-QEMU hosts
+%VirtioGpu.DeviceDesc% = VirtioGpu, PCI\VEN_1AF4&DEV_1010
+
+;---------------------------- VIRTIO GPU DRIVER ----------------------------
+
+[VirtioGpu]
+CopyFiles = VirtioGpu.Miniport_CopyFiles, VirtioGpu.Display_CopyFiles
+
+[VirtioGpu.Miniport_CopyFiles]
+virtio_gpu.sys
+
+[VirtioGpu.Display_CopyFiles]
+framebuf.dll
+
+[VirtioGpu.SoftwareSettings]
+AddReg = VirtioGpu_SoftwareSettings
+
+[VirtioGpu_SoftwareSettings]
+HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, framebuf
+HKR,, VgaCompatible,           %REG_DWORD%,    0
+
+[VirtioGpu.Services]
+AddService = virtio_gpu, 0x00000002, VirtioGpu_Service
+
+[VirtioGpu_Service]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 0
+ServiceBinary = %12%\virtio_gpu.sys
+LoadOrderGroup = Video
+
+;-------------------------------- STRINGS -------------------------------
+
+[Strings]
+; Non-localizable
+ReactOS = "ReactOS Project"
+VirtioGpu = "VirtIO GPU"
+
+REG_MULTI_SZ   = 0x00010000
+REG_DWORD      = 0x00010001
+
+; Localizable
+VirtioGpu.DeviceDesc = "VirtIO GPU"
